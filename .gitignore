@@ -1,0 +1,36 @@
+# 构建产物
+target/
+**/target/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 输入数据(大文件不入库, 放置 data/dem.tif 后即可运行)
+data/dem.tif
+
+# 中间产物(可按 README 重新生成)
+work/
+
+# 运行输出(可重新生成)
+output/
+verify_out/
+**/app_out/
+**/demo_out/
+**/sample_out/
+**/topo_out/
+
+# 发布压缩包(通过 GitHub Releases 分发)
+dist/
+
+# 截图与日志
+*.log
+ui_shot*.png
+
+# IDE
+.idea/
+.vscode/
+
+# Manba 提供的早期参考脚本(仅本地保留, 不推送远端)
+python/legacy/
