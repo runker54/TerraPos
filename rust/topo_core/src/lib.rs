@@ -21,6 +21,7 @@ pub mod input;
 pub mod pipeline;
 pub mod ridge;
 pub mod scale;
+pub mod slope_position;
 pub mod slope_unit;
 pub mod segment;
 pub mod terrain;

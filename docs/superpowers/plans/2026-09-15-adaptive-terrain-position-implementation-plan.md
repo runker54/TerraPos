@@ -723,17 +723,17 @@ git commit -m "feat: sample morphology at local terrain scale"
 - Modify: `rust/topo_core/src/lib.rs`
 - Modify: `rust/topo_core/tests/classification.rs`
 
-- [ ] **Step 1: Write failing membership tests**
+- [x] **Step 1: Write failing membership tests**
 
 Test exact ordering at `q=0.1`, `0.5`, and `0.9`; continuity either side of 0.38 and 0.62; tie behavior at the centre; morphology evidence resolving a near tie; confidence equal to the largest membership minus the second largest; low-confidence geometry reducing confidence without changing membership order.
 
-- [ ] **Step 2: Run and confirm failure**
+- [x] **Step 2: Run and confirm failure**
 
 Run: `cd rust; cargo test --release --test classification fuzzy_membership`
 
 Expected: missing `slope_position` module.
 
-- [ ] **Step 3: Implement the fuzzy model**
+- [x] **Step 3: Implement the fuzzy model**
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,7 +765,7 @@ L = L0 + 0.20*morph.lower
 
 Normalize `U/M/L`. Resolve exact ties in favour of middle, then lower, then upper; this prevents small floating-point changes from creating false crest pixels. Confidence is `max-second_max`; multiply it by 0.6 for `morph.low_confidence` or missing slope anchors.
 
-- [ ] **Step 4: Run and commit**
+- [x] **Step 4: Run and commit**
 
 Run: `cd rust; cargo test --release --test classification fuzzy_membership`
 
