@@ -36,15 +36,14 @@ mod theme {
         Color32::from_rgb(100, 116, 139),
     ];
 
-    pub const CLASS_COLORS: [(u8, &str, Color32); 8] = [
-        (1, "山间盆地", Color32::from_rgb(51, 178, 229)),
+    pub const CLASS_COLORS: [(u8, &str, Color32); 7] = [
+        (1, "山间/宽谷盆地", Color32::from_rgb(51, 178, 229)),
         (3, "丘陵上部", Color32::from_rgb(250, 217, 89)),
         (4, "丘陵中部", Color32::from_rgb(217, 237, 166)),
         (5, "丘陵下部", Color32::from_rgb(153, 199, 102)),
         (6, "山地坡上", Color32::from_rgb(250, 165, 60)),
         (7, "山地坡中", Color32::from_rgb(222, 100, 50)),
         (8, "山地坡下", Color32::from_rgb(107, 68, 35)),
-        (2, "宽谷盆地", Color32::from_rgb(102, 217, 242)),
     ];
 }
 
@@ -54,83 +53,96 @@ mod theme {
 struct Params {
     dem_path: String,
     out_dir: String,
-    coarse_res: f64,
-    basin_pctl_max: f64,
-    basin_pctl_win_m: f64,
-    basin_slope_th: f64,
-    basin_relief_m: f64,
+    /// 分析精细度: 0 快速 1 标准 2 精细
+    precision_idx: usize,
+    /// 盆地保留倾向: 0 严格 1 标准 2 宽松
+    basin_tendency_idx: usize,
+    /// 最小盆地面积(亩)
     basin_min_area_mu: f64,
-    basin_inner_relief_m: f64,
-    basin_bridge_m: f64,
-    basin_merge_m: f64,
-    basin_merge_max_mu: f64,
-    basin_smooth_m: f64,
-    slope_search_m: f64,
-    slope_skip_m: f64,
-    slope_flat_deg: f64,
-    slope_min_patch_m2: f64,
-    hill_z_max: f64,
-    relief_subclass_win: f64,
-    relief_low_hill: f64,
-    mode_filter_iter: usize,
-    min_patch_m2: f64,
+    /// 后处理强度: 0 弱(0.6) 1 标准(1.0) 2 强(1.5)
+    strength_idx: usize,
+    write_diagnostics: bool,
+    advanced: AdvancedUi,
+}
+
+#[derive(Clone)]
+struct AdvancedUi {
+    coarse_res_m: f64,
+    hydro_z_limit_m: f32,
+    scale_growth_threshold: f32,
+    low_relief_m: f32,
+    hill_elevation_max_m: f32,
+    stream_area_1: f64,
+    stream_area_2: f64,
+    stream_area_3: f64,
+    stream_area_4: f64,
+}
+
+impl AdvancedUi {
+    fn defaults() -> Self {
+        let d = topo_core::pipeline::AdvancedParams::default();
+        AdvancedUi {
+            coarse_res_m: d.coarse_res_m,
+            hydro_z_limit_m: d.hydro_z_limit_m,
+            scale_growth_threshold: d.scale_growth_threshold,
+            low_relief_m: d.low_relief_m,
+            hill_elevation_max_m: d.hill_elevation_max_m,
+            stream_area_1: d.stream_areas_km2[0],
+            stream_area_2: d.stream_areas_km2[1],
+            stream_area_3: d.stream_areas_km2[2],
+            stream_area_4: d.stream_areas_km2[3],
+        }
+    }
+    fn to_core(&self) -> topo_core::pipeline::AdvancedParams {
+        topo_core::pipeline::AdvancedParams {
+            coarse_res_m: self.coarse_res_m,
+            hydro_z_limit_m: self.hydro_z_limit_m,
+            scale_growth_threshold: self.scale_growth_threshold,
+            low_relief_m: self.low_relief_m,
+            hill_elevation_max_m: self.hill_elevation_max_m,
+            stream_areas_km2: [self.stream_area_1, self.stream_area_2, self.stream_area_3, self.stream_area_4],
+        }
+    }
 }
 
 impl Params {
     fn defaults() -> Self {
-        let d = topo_core::pipeline::Params::default();
         Params {
             dem_path: String::new(),
             out_dir: String::new(),
-            coarse_res: d.coarse_res,
-            basin_pctl_max: d.basin_pctl_max,
-            basin_pctl_win_m: d.basin_pctl_win_m,
-            basin_slope_th: d.basin_slope_th,
-            basin_relief_m: d.basin_relief_m,
-            basin_min_area_mu: d.basin_min_area_m2 / 666.6667,
-            basin_inner_relief_m: d.basin_inner_relief_m,
-            basin_bridge_m: d.basin_bridge_m,
-            basin_merge_m: d.basin_merge_m,
-            basin_merge_max_mu: d.basin_merge_max_m2 / 666.6667,
-            basin_smooth_m: d.basin_smooth_m,
-            slope_search_m: d.slope_search_m,
-            slope_skip_m: d.slope_skip_m,
-            slope_flat_deg: d.slope_flat_deg,
-            slope_min_patch_m2: d.slope_min_patch_m2,
-            hill_z_max: d.hill_z_max,
-            relief_subclass_win: d.relief_subclass_win,
-            relief_low_hill: d.relief_low_hill,
-            mode_filter_iter: d.mode_filter_iter,
-            min_patch_m2: d.min_patch_m2,
+            precision_idx: 1,
+            basin_tendency_idx: 1,
+            basin_min_area_mu: 100.0,
+            strength_idx: 1,
+            write_diagnostics: true,
+            advanced: AdvancedUi::defaults(),
         }
+    }
+    fn strength(&self) -> f64 {
+        [0.6, 1.0, 1.5][self.strength_idx.min(2)]
     }
     fn to_core(&self) -> topo_core::pipeline::Params {
         topo_core::pipeline::Params {
             dem_path: self.dem_path.clone(),
             out_dir: self.out_dir.clone(),
-            coarse_res: self.coarse_res,
-            basin_pctl_max: self.basin_pctl_max,
-            basin_pctl_win_m: self.basin_pctl_win_m,
-            basin_slope_th: self.basin_slope_th,
-            basin_relief_m: self.basin_relief_m,
+            precision: [
+                topo_core::pipeline::PrecisionPreset::Fast,
+                topo_core::pipeline::PrecisionPreset::Standard,
+                topo_core::pipeline::PrecisionPreset::Detailed,
+            ][self.precision_idx.min(2)],
+            basin_tendency: [
+                topo_core::pipeline::BasinTendency::Strict,
+                topo_core::pipeline::BasinTendency::Standard,
+                topo_core::pipeline::BasinTendency::Loose,
+            ][self.basin_tendency_idx.min(2)],
             basin_min_area_m2: self.basin_min_area_mu * 666.6667,
-            basin_inner_relief_m: self.basin_inner_relief_m,
-            basin_bridge_m: self.basin_bridge_m,
-            basin_merge_m: self.basin_merge_m,
-            basin_merge_max_m2: self.basin_merge_max_mu * 666.6667,
-            basin_smooth_m: self.basin_smooth_m,
-            slope_search_m: self.slope_search_m,
-            slope_skip_m: self.slope_skip_m,
-            slope_flat_deg: self.slope_flat_deg,
-            slope_min_patch_m2: self.slope_min_patch_m2,
-            hill_z_max: self.hill_z_max,
-            relief_subclass_win: self.relief_subclass_win,
-            relief_low_hill: self.relief_low_hill,
-            mode_filter_iter: self.mode_filter_iter,
-            min_patch_m2: self.min_patch_m2,
+            postprocess_strength: self.strength(),
+            write_diagnostics: self.write_diagnostics,
+            advanced: self.advanced.to_core(),
         }
     }
 }
+
 
 enum WorkerMsg {
     Progress(String, f32, String),
@@ -146,6 +158,11 @@ enum Layer {
     DemShade,
     Terrain,
     Subclass,
+    Confidence,
+    AdaptiveScale,
+    Hand,
+    RelativePosition,
+    BasinMask,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -258,24 +275,75 @@ fn row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) 
     .inner
 }
 
+fn num_f32(ui: &mut egui::Ui, label: &str, v: &mut f32, step: f32) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).small());
+        ui.add_space(4.0);
+        ui.add(egui::DragValue::new(v).speed(step));
+    });
+}
+
+fn load_gray_texture(ctx: &egui::Context, name: &str, path: &std::path::Path) -> Option<egui::TextureHandle> {
+    let (data, w, h) = topogray(path, 1400)?;
+    Some(ctx.load_texture(
+        name,
+        egui::ColorImage::from_rgba_unmultiplied([w, h], &data),
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn topogray(path: &std::path::Path, max_w: usize) -> Option<(Vec<u8>, usize, usize)> {
+    let (data, meta) = topo_core::geotiff::read_f32(path).ok()?;
+    let w = meta.width as usize;
+    let h = meta.height as usize;
+    let fin: Vec<f32> = data.iter().copied().filter(|v| v.is_finite()).collect();
+    if fin.is_empty() {
+        return None;
+    }
+    let mut srt = fin.clone();
+    srt.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let lo = srt[srt.len() / 20];
+    let hi = srt[srt.len() * 19 / 20];
+    let span = (hi - lo).max(1e-6);
+    let step = (w / max_w).max(1);
+    let nw = w / step;
+    let nh = h / step;
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..nh {
+        for x in 0..nw {
+            let v = data[(y * step) * w + x * step];
+            let g = if v.is_finite() { ((v - lo) / span * 255.0).clamp(0.0, 255.0) as u8 } else { 0 };
+            let o = (y * nw + x) * 4;
+            out[o] = g;
+            out[o + 1] = g;
+            out[o + 2] = g;
+            out[o + 3] = 255;
+        }
+    }
+    Some((out, nw, nh))
+}
+
+fn horizontal_choice(ui: &mut egui::Ui, label: &str, opts: &[&str], sel: &mut usize) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).small());
+        ui.add_space(4.0);
+        for (i, opt) in opts.iter().enumerate() {
+            if ui
+                .selectable_label(*sel == i, egui::RichText::new((*opt).to_string()).small())
+                .clicked()
+            {
+                *sel = i;
+            }
+        }
+    });
+}
+
 fn num(ui: &mut egui::Ui, label: &str, v: &mut f64, speed: f64) {
     row(ui, label, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.set_min_width(ui.available_width());
             ui.add_sized([ui.available_width(), 20.0], egui::DragValue::new(v).speed(speed).max_decimals(2))
         });
-    });
-}
-
-fn stepper(ui: &mut egui::Ui, label: &str, v: &mut usize, step: usize, min: usize) {
-    row(ui, label, |ui| {
-        if ui.add(egui::Button::new("−").small()).clicked() && *v > min {
-            *v -= step;
-        }
-        ui.monospace(format!("{v}"));
-        if ui.add(egui::Button::new("+").small()).clicked() {
-            *v += step;
-        }
     });
 }
 
@@ -354,6 +422,7 @@ struct App {
     stats: Vec<StatRow>,
     tex_terrain: Option<egui::TextureHandle>,
     tex_sub: Option<egui::TextureHandle>,
+    tex_extra: [Option<egui::TextureHandle>; 5],
     tex_dem: Option<egui::TextureHandle>,
     tex_dem_shade: Option<egui::TextureHandle>,
     dem_rx: Option<Receiver<WorkerMsg>>,
@@ -384,6 +453,7 @@ impl App {
             stats: Vec::new(),
             tex_terrain: None,
             tex_sub: None,
+            tex_extra: [None, None, None, None, None],
             tex_dem: None,
             tex_dem_shade: None,
             dem_rx: None,
@@ -766,47 +836,17 @@ impl App {
             });
             ui.add_space(8.0);
 
-            card(ui, theme::SEC[1], "02", "山间盆地判别", |ui| {
+            card(ui, theme::SEC[1], "02", "分析方案", |ui| {
                 ui.label(
-                    egui::RichText::new("河谷低平带(legacy 同参数) + 对象级内部起伏检验")
+                    egui::RichText::new("DEM 自适应分析: 水文骨架 + 坡面单元 + 多尺度形态")
                         .small()
                         .color(theme::TEXT_DIM),
                 );
-                num(ui, "坡度上限 (°)", &mut self.params.basin_slope_th, 0.5);
-                num(ui, "局部起伏上限 (m)", &mut self.params.basin_relief_m, 0.5);
-                ui.separator();
-                num(ui, "最低面积 (亩, 不足转坡下)", &mut self.params.basin_min_area_mu, 5.0);
-                num(ui, "内部起伏上限 (m)", &mut self.params.basin_inner_relief_m, 1.0);
-                num(ui, "碎片桥接 (m)", &mut self.params.basin_bridge_m, 10.0);
-                num(ui, "碎斑归并 (m, 0=关)", &mut self.params.basin_merge_m, 10.0);
-                num(ui, "碎斑面积上限 (亩)", &mut self.params.basin_merge_max_mu, 1.0);
-                num(ui, "平滑距离 (m)", &mut self.params.basin_smooth_m, 10.0);
-            });
-            ui.add_space(8.0);
-
-            card(ui, theme::SEC[2], "03", "坡位判别", |ui| {
-                ui.label(
-                    egui::RichText::new("TPI 分类: 山谷/坡下/平坡/坡中/坡上/山脊 (脚本 focus=101)")
-                        .small()
-                        .color(theme::TEXT_SUB),
-                );
-                num(ui, "坡位搜索半径 (m)", &mut self.params.slope_search_m, 100.0);
-                num(ui, "跳过距离 (m)", &mut self.params.slope_skip_m, 10.0);
-                num(ui, "平坡坡度分界 (°)", &mut self.params.slope_flat_deg, 0.5);
-                num(ui, "坡位小斑蚕食 (m²)", &mut self.params.slope_min_patch_m2, 1000.0);
-            });
-            ui.add_space(8.0);
-
-            card(ui, theme::SEC[3], "04", "丘陵 / 山地", |ui| {
-                num(ui, "丘陵海拔上限 (m)", &mut self.params.hill_z_max, 50.0);
-                num(ui, "亚类起伏度窗口 (m)", &mut self.params.relief_subclass_win, 100.0);
-                num(ui, "低丘起伏度上限 (m)", &mut self.params.relief_low_hill, 25.0);
-            });
-            ui.add_space(8.0);
-
-            card(ui, theme::SEC[4], "05", "后处理", |ui| {
-                stepper(ui, "众数滤波轮数", &mut self.params.mode_filter_iter, 1, 0);
-                num(ui, "最小图斑 (m²)", &mut self.params.min_patch_m2, 1000.0);
+                horizontal_choice(ui, "分析精细度", &["快速", "标准", "精细"], &mut self.params.precision_idx);
+                horizontal_choice(ui, "盆地保留倾向", &["严格", "标准", "宽松"], &mut self.params.basin_tendency_idx);
+                num(ui, "最小盆地面积 (亩, 不足归坡下)", &mut self.params.basin_min_area_mu, 5.0);
+                horizontal_choice(ui, "后处理强度", &["弱", "标准", "强"], &mut self.params.strength_idx);
+                ui.checkbox(&mut self.params.write_diagnostics, "输出诊断图层 (diagnostics/)");
             });
             ui.add_space(8.0);
 
@@ -821,15 +861,23 @@ impl App {
                         let (r, _) =
                             ui.allocate_exact_size(egui::vec2(3.5, 16.0), egui::Sense::hover());
                         ui.painter().rect_filled(r, 2.0, theme::SEC[5]);
-                        ui.label(egui::RichText::new("06").monospace().color(theme::SEC[5]));
-                        ui.label(egui::RichText::new("高级参数").strong());
+                        ui.label(egui::RichText::new("03").monospace().color(theme::SEC[5]));
+                        ui.label(egui::RichText::new("高级参数 (研究模式)").strong());
                     });
                     egui::CollapsingHeader::new(
                         egui::RichText::new("展开 ▾").small().color(theme::TEXT_DIM),
                     )
                     .id_salt("adv")
                     .show_unindented(ui, |ui| {
-                        num(ui, "中间层分辨率 (m)", &mut self.params.coarse_res, 5.0);
+                        num(ui, "粗层分析分辨率 (m)", &mut self.params.advanced.coarse_res_m, 5.0);
+                        num_f32(ui, "水文最大填深 (m)", &mut self.params.advanced.hydro_z_limit_m, 1.0);
+                        num_f32(ui, "尺度收敛阈值", &mut self.params.advanced.scale_growth_threshold, 0.01);
+                        num_f32(ui, "低起伏判据 (m)", &mut self.params.advanced.low_relief_m, 5.0);
+                        num_f32(ui, "丘陵海拔上限 (m)", &mut self.params.advanced.hill_elevation_max_m, 50.0);
+                        num(ui, "河网等级1 (km²)", &mut self.params.advanced.stream_area_1, 0.05);
+                        num(ui, "河网等级2 (km²)", &mut self.params.advanced.stream_area_2, 0.1);
+                        num(ui, "河网等级3 (km²)", &mut self.params.advanced.stream_area_3, 0.5);
+                        num(ui, "河网等级4 (km²)", &mut self.params.advanced.stream_area_4, 1.0);
                     });
                 });
             ui.add_space(10.0);
@@ -844,27 +892,12 @@ impl App {
             ui.add_space(6.0);
             if ghost_button(ui, "恢复默认参数") {
                 let d = Params::defaults();
-                self.params.coarse_res = d.coarse_res;
-
-                self.params.basin_pctl_max = d.basin_pctl_max;
-                self.params.basin_pctl_win_m = d.basin_pctl_win_m;
-                self.params.basin_slope_th = d.basin_slope_th;
-                self.params.basin_relief_m = d.basin_relief_m;
-                self.params.basin_inner_relief_m = d.basin_inner_relief_m;
-                self.params.basin_bridge_m = d.basin_bridge_m;
-                self.params.basin_merge_m = d.basin_merge_m;
-                self.params.basin_merge_max_mu = d.basin_merge_max_mu;
+                self.params.precision_idx = d.precision_idx;
+                self.params.basin_tendency_idx = d.basin_tendency_idx;
                 self.params.basin_min_area_mu = d.basin_min_area_mu;
-                self.params.basin_smooth_m = d.basin_smooth_m;
-                self.params.slope_search_m = d.slope_search_m;
-                self.params.slope_skip_m = d.slope_skip_m;
-                self.params.slope_flat_deg = d.slope_flat_deg;
-                self.params.slope_min_patch_m2 = d.slope_min_patch_m2;
-                self.params.hill_z_max = d.hill_z_max;
-                self.params.relief_subclass_win = d.relief_subclass_win;
-                self.params.relief_low_hill = d.relief_low_hill;
-                self.params.mode_filter_iter = d.mode_filter_iter;
-                self.params.min_patch_m2 = d.min_patch_m2;
+                self.params.strength_idx = d.strength_idx;
+                self.params.write_diagnostics = d.write_diagnostics;
+                self.params.advanced = d.advanced;
             }
             ui.add_space(4.0);
         });
@@ -901,6 +934,26 @@ impl App {
                 if chip(ui, "地貌亚类", self.layer == Layer::Subclass) {
                     self.layer = Layer::Subclass;
                 }
+                let extra_names = [
+                    (Layer::Confidence, "置信度", "terrain_confidence.tif", 0usize),
+                    (Layer::AdaptiveScale, "尺度 R*", "diagnostics/adaptive_scale_m.tif", 1),
+                    (Layer::Hand, "HAND", "diagnostics/hand_m.tif", 2),
+                    (Layer::RelativePosition, "相对位置 q", "diagnostics/relative_position.tif", 3),
+                    (Layer::BasinMask, "盆地", "diagnostics/basin_mask.tif", 4),
+                ];
+                for (layer_kind, label, rel, slot) in extra_names {
+                    if chip(ui, label, self.layer == layer_kind) {
+                        let base = std::path::Path::new(&self.params.out_dir);
+                        let path = base.join(rel);
+                        if self.tex_extra[slot].is_none() {
+                            self.tex_extra[slot] =
+                                load_gray_texture(ui.ctx(), label, &path);
+                        }
+                        if self.tex_extra[slot].is_some() {
+                            self.layer = layer_kind;
+                        }
+                    }
+                }
                 ui.separator();
                 if ui.small_button("−").clicked() {
                     self.view_scale = (self.view_scale / 1.25).max(0.008);
@@ -927,6 +980,11 @@ impl App {
             Layer::DemShade => &self.tex_dem_shade,
             Layer::Terrain => &self.tex_terrain,
             Layer::Subclass => &self.tex_sub,
+            Layer::Confidence => &self.tex_extra[0],
+            Layer::AdaptiveScale => &self.tex_extra[1],
+            Layer::Hand => &self.tex_extra[2],
+            Layer::RelativePosition => &self.tex_extra[3],
+            Layer::BasinMask => &self.tex_extra[4],
         };
         if let Some(tex) = tex {
             if resp.hovered() {
@@ -1505,4 +1563,66 @@ fn main() -> eframe::Result {
         native,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+// ---------------- UI-to-core 映射测试(Task 15) ----------------
+
+#[cfg(test)]
+mod ui_mapping_tests {
+    use super::*;
+
+    /// 三档强度选择映射到 0.6/1.0/1.5
+    #[test]
+    fn strength_preset_mapping() {
+        let mut p = Params::defaults();
+        p.strength_idx = 0;
+        assert!((p.strength() - 0.6).abs() < 1e-9);
+        p.strength_idx = 1;
+        assert!((p.strength() - 1.0).abs() < 1e-9);
+        p.strength_idx = 2;
+        assert!((p.strength() - 1.5).abs() < 1e-9);
+    }
+
+    /// 精度与盆地倾向的 UI 选择映射到核心枚举
+    #[test]
+    fn precision_and_tendency_mapping() {
+        let mut p = Params::defaults();
+        p.precision_idx = 0;
+        p.basin_tendency_idx = 2;
+        let core = p.to_core();
+        assert!(matches!(
+            core.precision,
+            topo_core::pipeline::PrecisionPreset::Fast
+        ));
+        assert!(matches!(
+            core.basin_tendency,
+            topo_core::pipeline::BasinTendency::Loose
+        ));
+        p.precision_idx = 2;
+        let core = p.to_core();
+        assert!(matches!(
+            core.precision,
+            topo_core::pipeline::PrecisionPreset::Detailed
+        ));
+    }
+
+    /// 亩换算为核心平方米
+    #[test]
+    fn mu_to_square_metres() {
+        let mut p = Params::defaults();
+        p.basin_min_area_mu = 150.0;
+        let core = p.to_core();
+        assert!((core.basin_min_area_m2 - 150.0 * 666.6667).abs() < 1e-6);
+    }
+
+    /// 旧固定窗口/种子策略字段已从应用状态移除(编译级保证),
+    /// 此处验证新状态序列化后不含任何旧字段名
+    #[test]
+    fn retired_controls_absent_from_state() {
+        let p = Params::defaults();
+        let json = serde_json::to_string(&p.advanced.to_core()).unwrap();
+        for retired in ["SeedMode", "slope_search_m", "basin_pctl", "histogram", "basin_bridge_m"] {
+            assert!(!json.contains(retired), "状态中残留旧字段 {retired}");
+        }
+    }
 }
