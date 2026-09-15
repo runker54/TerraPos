@@ -34,3 +34,8 @@ ui_shot*.png
 
 # Manba 提供的早期参考脚本(仅本地保留, 不推送远端)
 python/legacy/
+
+# 验证产物(可由脚本重建)
+data/synthetic/
+data/validation_out/
+data/qa/

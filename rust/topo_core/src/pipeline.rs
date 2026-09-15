@@ -308,7 +308,33 @@ pub fn run_arrays(
 
     // ---- 8 隶属度 ----
     say(64.0, "隶属", "模糊上/中/下隶属度...")?;
-    let positions = classify_slope_positions(&geom.relative_position, &morph, &coarse_valid)?;
+    // q 场 3x3 中值平滑: 抑制锚点切换造成的椒盐反转(空间一致性)
+    let mut q_smoothed = geom.relative_position.clone();
+    {
+        let mut buf = q_smoothed.clone();
+        for y in 1..ch - 1 {
+            for x in 1..cw - 1 {
+                let i = y * cw + x;
+                let mut nbr: Vec<f32> = Vec::with_capacity(9);
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let j = (y as i64 + dy) as usize * cw + (x as i64 + dx) as usize;
+                        if coarse_valid[j] && geom.relative_position[j].is_finite() {
+                            nbr.push(geom.relative_position[j]);
+                        }
+                    }
+                }
+                nbr.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                if let Some(mid) = nbr.get(nbr.len() / 2) {
+                    if mid.is_finite() {
+                        buf[i] = *mid;
+                    }
+                }
+            }
+        }
+        q_smoothed = buf;
+    }
+    let positions = classify_slope_positions(&q_smoothed, &morph, &coarse_valid)?;
 
     // ---- 9 盆地 ----
     say(70.0, "盆地", "低平候选 + 对象检验 + 边界重建...")?;

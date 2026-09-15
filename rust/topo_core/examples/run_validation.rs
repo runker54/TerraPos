@@ -9,7 +9,7 @@ use topo_core::pipeline::{run, BasinTendency, Params, PrecisionPreset};
 
 const SCENE_DIR: &str = "../data/synthetic/generated";
 const VALIDATION_OUT: &str = "../data/validation_out";
-const REAL_DEM: &str = "../../data/dem.tif";
+const REAL_DEM: &str = "../data/dem.tif";
 
 fn scene_params(dem: &str, out: &str, area_scale: f64, strength_scale: f64, z_scale: f64) -> Params {
     let mut adv = topo_core::pipeline::AdvancedParams::default();
