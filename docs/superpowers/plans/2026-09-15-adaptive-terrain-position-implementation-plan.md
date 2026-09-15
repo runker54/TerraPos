@@ -786,17 +786,17 @@ git commit -m "feat: classify fuzzy upper middle and lower positions"
 - Create: `rust/topo_core/tests/basin_objects.rs`
 - Modify: `rust/topo_core/src/lib.rs`
 
-- [ ] **Step 1: Write failing basin discrimination tests**
+- [x] **Step 1: Write failing basin discrimination tests**
 
 Use four scenes: broad enclosed basin, broad stream-connected valley basin, narrow V-valley, and flat upland. Assert the first two are accepted, the latter two rejected. For the accepted basin, assert the final mask includes at least 90% of the known flat-floor candidate while the width core occupies a smaller area. Assert increasing `basin_min_area_m2` removes only undersized objects.
 
-- [ ] **Step 2: Run and confirm failure**
+- [x] **Step 2: Run and confirm failure**
 
 Run: `cd rust; cargo test --release --test basin_objects`
 
 Expected: unresolved `basin` module.
 
-- [ ] **Step 3: Define basin products and policy**
+- [x] **Step 3: Define basin products and policy**
 
 ```rust
 pub struct BasinConfig {
@@ -831,7 +831,7 @@ pub fn detect_basins(
 ) -> Result<BasinResult>;
 ```
 
-- [ ] **Step 4: Build the pixel candidate with adaptive thresholds**
+- [x] **Step 4: Build the pixel candidate with adaptive thresholds**
 
 Candidate requires lower geomorphic evidence; stream connectivity or recorded closed depression; `q<0.45`; low local slope, relief, and HAND; and low-flat persistence in at least three adjacent scale layers. For each cell compute:
 
@@ -843,7 +843,7 @@ HANDmax = clip(0.02*H* + 2, 5, 20) m
 
 Slope limits by relief/elevation subclass are exactly `6, 5.5, 5, 5, 4, 4` degrees from low hill through extreme mountain. Map `Strict/Standard/Loose` to multiplicative factors `0.85/1.00/1.15` on `Hmicro`, `HANDmax`, and slope limit only; do not change object area or width rules.
 
-- [ ] **Step 5: Evaluate connected objects**
+- [x] **Step 5: Evaluate connected objects**
 
 For every candidate object derive:
 
@@ -857,11 +857,11 @@ required_surround = max(10, 0.05*median(H*)) m
 
 Measure width with Euclidean distance to the candidate boundary: `width=2*distance`. Require area ≥Amin, maximum width ≥Wmin, median width ≥0.5Wmin, `P95-P05 ≤ Hinner`, ring median elevation rise ≥required surround, hydrological connection or closed-depression flag, and three-scale persistence.
 
-- [ ] **Step 6: Reconstruct the complete basin mask**
+- [x] **Step 6: Reconstruct the complete basin mask**
 
 Define core cells as candidate width ≥Wmin. Reject objects with no core. Starting from accepted cores, perform geodesic reconstruction constrained to the original candidate component and stop at ridge barriers. The output `mask` is the reconstructed candidate, not the eroded width core. Fill only interior holes smaller than `min(0.1*object_area, 20_000 m²)`.
 
-- [ ] **Step 7: Run and commit**
+- [x] **Step 7: Run and commit**
 
 Run: `cd rust; cargo test --release --test basin_objects`
 

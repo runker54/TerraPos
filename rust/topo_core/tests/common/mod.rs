@@ -4,7 +4,7 @@
 //! 保证同一场景在不同分辨率下解析一致, 供尺度稳定性测试复用。
 
 use topo_core::geotiff::GeoMeta;
-use topo_core::input::RasterShape;
+use topo_core::input::{prepare_values, RasterShape};
 
 /// 构造带 GeoKey 目录的内存 GeoMeta(模型类型 + 线性单位可指定),
 /// 供输入契约测试表达投影米制/地理度/投影英尺等元数据组合。
@@ -62,8 +62,8 @@ pub fn broad_basin(width: usize, height: usize, res: f64) -> (Vec<f32>, RasterSh
                 let x = (col as f64 + 0.5) * res - cx;
                 let y = (row as f64 + 0.5) * res - cy;
                 let r = x.hypot(y);
-                let floor = 800.0 + 0.002 * x;
-                let rim = ((r - 900.0) / 250.0).clamp(0.0, 1.0);
+                let floor = 800.0 + 0.0005 * x;
+                let rim = ((r - 700.0) / 250.0).clamp(0.0, 1.0);
                 (floor + 120.0 * rim * rim) as f32
             })
         })
@@ -143,4 +143,144 @@ pub fn with_border_nodata(width: usize, height: usize, res: f64) -> (Vec<f32>, R
         }
     }
     (z, shape)
+}
+
+// ---------------- 共享测试上下文(粗层全链) ----------------
+
+use topo_core::geomorphon::{geomorphon_pattern, pattern_to_landform, Landform};
+use topo_core::hydro::{build_hydro, HydroConfig, HydroModel};
+use topo_core::ridge::build_ridges;
+use topo_core::slope_unit::build_slope_units;
+use topo_core::scale::{build_scale_pyramid, ScalePyramid};
+
+pub struct Context {
+    pub coarse: Vec<f32>,
+    pub valid: Vec<bool>,
+    pub shape: RasterShape,
+    pub hydro: HydroModel,
+    pub pyramid: ScalePyramid,
+    pub landform: Vec<Landform>,
+}
+
+fn hydro_cfg() -> HydroConfig {
+    HydroConfig {
+        coarse_res_m: 25.0,
+        z_limit_m: 15.0,
+        stream_areas_km2: [0.05, 0.20, 1.00, 5.00],
+    }
+}
+
+pub fn build_context(dem: Vec<f32>, w: u32, h: u32, res: f64) -> Context {
+    let prepared = prepare_values(
+        dem,
+        meta_with_keys(w, h, res, 1, 9001),
+        &Default::default(),
+    )
+    .unwrap();
+    let hydro = build_hydro(&prepared, &hydro_cfg()).unwrap();
+    let cw = hydro.shape.width;
+    let ch = hydro.shape.height;
+    let coarse_res = hydro_cfg().coarse_res_m;
+    let native = prepared.shape;
+    // 米制边界映射, 与 hydro::downsample_bounded 完全一致
+    let edge = |i: usize, total: usize| -> (usize, usize) {
+        let s = ((i as f64 * coarse_res / native.resolution_m).round() as usize).min(total);
+        let e = ((((i + 1) as f64 * coarse_res / native.resolution_m).round() as usize)
+            .min(total))
+        .max(s + 1);
+        (s, e)
+    };
+    let mut coarse = vec![0f32; cw * ch];
+    let mut valid = vec![false; cw * ch];
+    for ty in 0..ch {
+        let (y0, y1) = edge(ty, native.height);
+        for tx in 0..cw {
+            let (x0, x1) = edge(tx, native.width);
+            let (mut mn, mut c) = (0f64, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = y * native.width + x;
+                    if prepared.valid[i] {
+                        mn += prepared.raw[i] as f64;
+                        c += 1;
+                    }
+                }
+            }
+            if c > 0 {
+                coarse[ty * cw + tx] = (mn / c as f64) as f32;
+                valid[ty * cw + tx] = true;
+            }
+        }
+    }
+    let pyramid =
+        build_scale_pyramid(&coarse, &valid, hydro.shape, 0.15).unwrap();
+    let mut landform = Vec::with_capacity(cw * ch);
+    for ty in 0..ch {
+        for tx in 0..cw {
+            let i = ty * cw + tx;
+            if !valid[i] {
+                landform.push(Landform::Flat);
+                continue;
+            }
+            let scale = pyramid.characteristic_scale_m[i].max(100.0) as f64;
+            let pat = geomorphon_pattern(
+                &coarse,
+                cw,
+                ch,
+                hydro_cfg().coarse_res_m,
+                tx,
+                ty,
+                scale,
+                2.0 * hydro_cfg().coarse_res_m,
+                3.0,
+            );
+            landform.push(pattern_to_landform(&pat));
+        }
+    }
+    Context {
+        coarse,
+        valid,
+        shape: hydro.shape,
+        hydro,
+        pyramid,
+        landform,
+    }
+}
+
+/// 完整链上下文: 含脊线/单元/约束几何/自适应形态证据
+pub fn full_chain(
+    dem: Vec<f32>,
+    w: u32,
+    h: u32,
+    res: f64,
+) -> (
+    Context,
+    topo_core::ridge::RidgeModel,
+    topo_core::slope_unit::SlopeUnits,
+    topo_core::slope_unit::SlopeGeometry,
+    topo_core::geomorphon::MorphEvidence,
+) {
+    let ctx = build_context(dem, w, h, res);
+    let ridges =
+        build_ridges(&ctx.coarse, &ctx.valid, &ctx.hydro, &ctx.pyramid, &ctx.landform).unwrap();
+    let units = build_slope_units(&ctx.coarse, &ctx.valid, &ctx.hydro, &ridges).unwrap();
+    let geom = topo_core::slope_unit::build_slope_geometry(
+        &ctx.coarse,
+        &ctx.valid,
+        &units,
+        &ctx.hydro,
+        &ctx.pyramid,
+        20.0,
+    )
+    .unwrap();
+    let scales = topo_core::scale::usable_scales(ctx.shape);
+    let morph = topo_core::geomorphon::adaptive_morphology_evidence(
+        &ctx.coarse,
+        &ctx.valid,
+        ctx.shape,
+        &geom.adaptive_scale_m,
+        &scales,
+    )
+    .unwrap();
+    (ctx, ridges, units, geom, morph)
 }

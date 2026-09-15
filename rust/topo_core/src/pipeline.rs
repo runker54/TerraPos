@@ -27,6 +27,15 @@ pub enum SeedMode {
     Hybrid,
 }
 
+/// 盆地保留倾向(设计规格 19 节: 普通 UI 参数)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasinTendency {
+    Strict,
+    Standard,
+    Loose,
+}
+
+
 /// 全部数值型指标参数（UI 表单一一对应）
 #[derive(Debug, Clone)]
 pub struct Params {

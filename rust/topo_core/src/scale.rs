@@ -18,6 +18,8 @@ pub struct ScaleLayer {
     pub deviation_m: Vec<f32>,
     /// H = P95 - P05(米)
     pub relief_m: Vec<f32>,
+    /// 四分位距 P75 - P25(米, 对窗外孤立高地稳健)
+    pub quartile_spread_m: Vec<f32>,
     /// NDEV = DEV / (1.4826 * MAD + 0.1)
     pub normalized_deviation: Vec<f32>,
 }
@@ -66,10 +68,12 @@ pub fn build_scale_pyramid(
     let mut reliefs: Vec<Vec<f32>> = Vec::with_capacity(scales.len());
     let mut layers: Vec<ScaleLayer> = Vec::with_capacity(scales.len());
     for &radius in &scales {
-        let (med, mad, p05, p95) = focal_robust_stats_valid(dem, valid, shape, radius);
+        let st = focal_robust_stats_valid(dem, valid, shape, radius);
+        let (med, mad, p05, p25, p75, p95) = (st.median, st.mad, st.p05, st.p25, st.p75, st.p95);
         let mut dev = vec![0f32; n];
         let mut ndev = vec![0f32; n];
         let mut relief = vec![0f32; n];
+        let mut spread = vec![0f32; n];
         for i in 0..n {
             if !valid[i] || !med[i].is_finite() {
                 continue;
@@ -78,12 +82,14 @@ pub fn build_scale_pyramid(
             dev[i] = d;
             ndev[i] = d / (1.4826 * mad[i] + 0.1);
             relief[i] = p95[i] - p05[i];
+            spread[i] = p75[i] - p25[i];
         }
         reliefs.push(relief.clone());
         layers.push(ScaleLayer {
             radius_m: radius,
             deviation_m: dev,
             relief_m: relief,
+            quartile_spread_m: spread,
             normalized_deviation: ndev,
         });
     }

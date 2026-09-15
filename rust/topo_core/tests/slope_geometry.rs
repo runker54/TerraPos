@@ -2,97 +2,10 @@
 
 mod common;
 
-use topo_core::geomorphon::{geomorphon_pattern, pattern_to_landform, Landform};
-use topo_core::hydro::{build_hydro, HydroConfig, HydroModel};
-use topo_core::input::{prepare_values, RasterShape};
+use common::{build_context, Context};
+use topo_core::hydro::HydroConfig;
 use topo_core::ridge::build_ridges;
-use topo_core::scale::{build_scale_pyramid, ScalePyramid};
 use topo_core::slope_unit::build_slope_units;
-
-fn hydro_cfg() -> HydroConfig {
-    HydroConfig {
-        coarse_res_m: 25.0,
-        z_limit_m: 15.0,
-        stream_areas_km2: [0.05, 0.20, 1.00, 5.00],
-    }
-}
-
-/// 粗层上下文: 粗层表面/有效掩膜/水文/金字塔/形态证据
-/// (与生产管线 Task 12 相同的降采样语义, 任一原生有效即粗层有效)
-struct Context {
-    coarse: Vec<f32>,
-    valid: Vec<bool>,
-    shape: RasterShape,
-    hydro: HydroModel,
-    pyramid: ScalePyramid,
-    landform: Vec<Landform>,
-}
-
-fn build_context(dem: Vec<f32>, w: u32, h: u32, res: f64) -> Context {
-    let prepared = prepare_values(
-        dem,
-        common::meta_with_keys(w, h, res, 1, 9001),
-        &Default::default(),
-    )
-    .unwrap();
-    let hydro = build_hydro(&prepared, &hydro_cfg()).unwrap();
-    let step = (hydro_cfg().coarse_res_m / res).round() as usize;
-    let cw = hydro.shape.width;
-    let ch = hydro.shape.height;
-    let mut coarse = vec![0f32; cw * ch];
-    let mut valid = vec![false; cw * ch];
-    for ty in 0..ch {
-        for tx in 0..cw {
-            let (mut mn, mut c) = (0f64, 0u32);
-            for y in ty * step..((ty + 1) * step).min(prepared.shape.height) {
-                for x in tx * step..((tx + 1) * step).min(prepared.shape.width) {
-                    let i = y * prepared.shape.width + x;
-                    if prepared.valid[i] {
-                        mn += prepared.raw[i] as f64;
-                        c += 1;
-                    }
-                }
-            }
-            if c > 0 {
-                coarse[ty * cw + tx] = (mn / c as f64) as f32;
-                valid[ty * cw + tx] = true;
-            }
-        }
-    }
-    let pyramid =
-        build_scale_pyramid(&coarse, &valid, hydro.shape, 0.15).unwrap();
-    let mut landform = Vec::with_capacity(cw * ch);
-    for ty in 0..ch {
-        for tx in 0..cw {
-            let i = ty * cw + tx;
-            if !valid[i] {
-                landform.push(Landform::Flat);
-                continue;
-            }
-            let scale = pyramid.characteristic_scale_m[i].max(100.0) as f64;
-            let pat = geomorphon_pattern(
-                &coarse,
-                cw,
-                ch,
-                hydro_cfg().coarse_res_m,
-                tx,
-                ty,
-                scale,
-                2.0 * hydro_cfg().coarse_res_m,
-                3.0,
-            );
-            landform.push(pattern_to_landform(&pat));
-        }
-    }
-    Context {
-        coarse,
-        valid,
-        shape: hydro.shape,
-        hydro,
-        pyramid,
-        landform,
-    }
-}
 
 /// 对称 V 谷: 中央谷不标脊, 两侧翼各含一条连续山脊
 #[test]
@@ -323,11 +236,20 @@ fn constrained_distance_never_crosses_ridge() {
     let (ctx, _r, units, geom) = full_geometry(dem, 201, 201, 10.0);
     let cw = ctx.shape.width;
     for i in 0..cw * ctx.shape.height {
+        // dv/dr 相对"所选等级"的对应谷/脊线(规格 9.2/9.3): 主干谷像元
+        // dv=0, 坡脚细谷延伸段到所选粗谷线距离有限
         if units.valley_mask[i] {
-            assert_eq!(geom.distance_to_valley_m[i], 0.0, "谷像元 {i} dv 应为 0");
+            let dv = geom.distance_to_valley_m[i];
+            assert!(dv.is_finite(), "谷像元 {i} dv 应有限");
+            if dv == 0.0 {
+                zero_dv += 1;
+            }
         }
         if units.ridge_mask[i] {
-            assert_eq!(geom.distance_to_ridge_m[i], 0.0, "脊像元 {i} dr 应为 0");
+            assert_eq!(
+                geom.distance_to_ridge_m[i], 0.0,
+                "脊像元 {i} dr 应为 0"
+            );
         }
         if geom.relative_position[i].is_finite() {
             assert!(
@@ -347,6 +269,7 @@ fn constrained_distance_never_crosses_ridge() {
     }
     // 谷锚不跨中央脊(粗列 40): x<40 的坡面像元锚 x<=22(左谷 500m/25m+2)
     let mut checked = 0usize;
+    let mut zero_dv = 0usize;
     for y in 5..ctx.shape.height - 5 {
         for x in 23..40usize {
             let i = y * cw + x;
@@ -362,6 +285,7 @@ fn constrained_distance_never_crosses_ridge() {
         }
     }
     assert!(checked > 200, "有效锚样本不足: {checked}");
+    assert!(zero_dv > 50, "主干谷 dv=0 样本不足: {zero_dv}");
 }
 
 /// 相对位置内部一致: q 由 qd/qz 按低起伏权重合成; 低起伏场景水平权重更大

@@ -303,6 +303,17 @@ pub fn hand_to_stream(
         loop {
             if done[cur] {
                 res_anchor = anchor[cur];
+                for &p in &path {
+                    let p = p as usize;
+                    done[p] = true;
+                    anchor[p] = res_anchor;
+                    hand[p] = if res_anchor == u32::MAX {
+                        f32::NAN
+                    } else {
+                        dem[p] - dem[res_anchor as usize]
+                    };
+                }
+                path.clear();
                 break;
             }
             if stream[cur] {
@@ -310,14 +321,52 @@ pub fn hand_to_stream(
                 hand[cur] = 0.0;
                 anchor[cur] = cur as u32;
                 done[cur] = true;
+                for &p in &path {
+                    let p = p as usize;
+                    done[p] = true;
+                    anchor[p] = res_anchor;
+                    hand[p] = dem[p] - dem[res_anchor as usize];
+                }
+                path.clear();
                 break;
             }
             if flow_to[cur] == cur as u32 {
-                break; // 出口: 沿链无河网
+                for &p in &path {
+                    let p = p as usize;
+                    done[p] = true;
+                    anchor[p] = res_anchor;
+                    hand[p] = if res_anchor == u32::MAX {
+                        f32::NAN
+                    } else {
+                        dem[p] - dem[res_anchor as usize]
+                    };
+                }
+                path.clear();
+                break;
+            }
+            // 深洼伪影: Priority-Flood 允许外坡低像元流向更高的深洼像元
+            // (爬升边)。按规格 8.3, 闭合洼地是独立水文子系统: 在爬升边
+            // 处切断锚继承, 本段以现有锚收尾, 翻越侧开始新链段。
+            let nxt = flow_to[cur] as usize;
+            if dem[nxt] > dem[cur] + 0.05 {
+                for &p in &path {
+                    let p = p as usize;
+                    done[p] = true;
+                    anchor[p] = res_anchor;
+                    hand[p] = if res_anchor == u32::MAX {
+                        f32::NAN
+                    } else {
+                        dem[p] - dem[res_anchor as usize]
+                    };
+                }
+                path.clear();
+                cur = nxt;
+                continue;
             }
             path.push(cur as u32);
-            cur = flow_to[cur] as usize;
+            cur = nxt;
         }
+        // 尾段(新段开始后未终止的 path)
         for &p in &path {
             let p = p as usize;
             done[p] = true;

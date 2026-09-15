@@ -226,13 +226,23 @@ use crate::input::RasterShape;
 
 /// 生产级滑窗稳健统计: 逐尺度把窗口抽稀到约 1/4 半径的瓦片网格上做精确
 /// 排序选取, 4000 m 半径也不会产生 O(n*r^2) 循环。
-/// 返回 (median, mad, p05, p95); 无效像元输出 NaN。
+/// 稳健统计返回集
+pub struct RobustStats {
+    pub median: Vec<f32>,
+    pub mad: Vec<f32>,
+    pub p05: Vec<f32>,
+    pub p25: Vec<f32>,
+    pub p75: Vec<f32>,
+    pub p95: Vec<f32>,
+}
+
+/// 返回滑窗稳健统计; 无效像元输出 NaN。
 pub fn focal_robust_stats_valid(
     dem: &[f32],
     valid: &[bool],
     shape: RasterShape,
     radius_m: f64,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> RobustStats {
     let n = shape.width * shape.height;
     let r_px = ((radius_m / shape.resolution_m).round() as i64).max(1);
     let step = (r_px / 4).max(1) as usize;
@@ -266,6 +276,8 @@ pub fn focal_robust_stats_valid(
     let mut med = vec![f32::NAN; n];
     let mut mad = vec![f32::NAN; n];
     let mut p05 = vec![f32::NAN; n];
+    let mut p25 = vec![f32::NAN; n];
+    let mut p75 = vec![f32::NAN; n];
     let mut p95 = vec![f32::NAN; n];
     let q = |sorted: &[f32], p: f64| -> f32 {
         let idx = (((sorted.len() - 1) as f64 * p).round() as usize).min(sorted.len() - 1);
@@ -302,7 +314,7 @@ pub fn focal_robust_stats_valid(
             let mut abs_sorted = abs.clone();
             abs_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let md = q(&abs_sorted, 0.5);
-            let (lo, hi) = (q(&vals, 0.05), q(&vals, 0.95));
+            let (lo, q1, q3, hi) = (q(&vals, 0.05), q(&vals, 0.25), q(&vals, 0.75), q(&vals, 0.95));
             for y in uy0..uy1 {
                 for x in ux0..ux1 {
                     let i = y * shape.width + x;
@@ -310,13 +322,22 @@ pub fn focal_robust_stats_valid(
                         med[i] = m;
                         mad[i] = md;
                         p05[i] = lo;
+                        p25[i] = q1;
+                        p75[i] = q3;
                         p95[i] = hi;
                     }
                 }
             }
         }
     }
-    (med, mad, p05, p95)
+    RobustStats {
+        median: med,
+        mad,
+        p05,
+        p25,
+        p75,
+        p95,
+    }
 }
 
 /// valid-aware 滑窗分位数(米制半径)
@@ -327,7 +348,8 @@ pub fn focal_quantile_valid(
     radius_m: f64,
     p: f64,
 ) -> Vec<f32> {
-    let (_, _, lo, hi) = focal_robust_stats_valid(dem, valid, shape, radius_m);
+    let st = focal_robust_stats_valid(dem, valid, shape, radius_m);
+    let (lo, hi) = (st.p05, st.p95);
     if p <= 0.5 {
         lo
     } else {
@@ -342,7 +364,7 @@ pub fn focal_median_valid(
     shape: RasterShape,
     radius_m: f64,
 ) -> Vec<f32> {
-    focal_robust_stats_valid(dem, valid, shape, radius_m).0
+    focal_robust_stats_valid(dem, valid, shape, radius_m).median
 }
 
 /// valid-aware 滑窗中位绝对偏差(米制半径; med 为预计算中位数场)

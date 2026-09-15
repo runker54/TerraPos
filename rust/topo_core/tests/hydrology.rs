@@ -58,13 +58,20 @@ fn hand_is_nodata_without_stream_downstream() {
     assert!(hand[0].is_nan() && hand[1].is_nan() && hand[2].is_nan());
 }
 
-/// 高程相对链上河网为负且低于 -0.05 m 时报错(表面或路由不一致)
+/// 爬升路由边(深洼伪影)必须切段而非跨段锚定:
+/// 链 5 -> 10 -> 8(stream) 中 0->1 为爬升边, 若跨段锚定将产生
+/// hand[0] = 5-8 = -3 的负值; 正确行为是 0 为 NoData、1 正常锚定。
+/// (Task 3 原负值报错保护的演进: 切段后结构性负值不可达,
+/// -0.05 报错保留为内部不变量兜底)
 #[test]
-fn hand_errors_on_negative_below_tolerance() {
+fn ascending_route_edges_are_segmented_not_negative() {
     let dem = vec![5., 10., 8.];
     let flow_to = vec![1, 2, 2];
     let stream = vec![false, false, true];
-    assert!(hand_to_stream(&dem, &flow_to, &stream, &[true; 3]).is_err());
+    let hand = hand_to_stream(&dem, &flow_to, &stream, &[true; 3]).unwrap();
+    assert!(hand[0].is_nan(), "爬升边外侧像元不得跨段锚定: {}", hand[0]);
+    assert_eq!(hand[1], 2.0);
+    assert_eq!(hand[2], 0.0);
 }
 
 /// 每个路由像元沿 flow_to 最多 n 步到达出口; 汇流沿下游非降

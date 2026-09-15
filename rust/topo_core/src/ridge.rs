@@ -38,12 +38,33 @@ pub fn build_ridges(
     let n = w * h;
     let stream = &hydro.streams[0];
 
-    // 1) 河网链标注: 拓扑序上每像元继承最大上游河链, 源头开新链
+    // 0) 深洼汇流区: 从深洼环沿 flow_to 反向 BFS(规格 8.3: 闭合洼地是
+    // 独立水文子系统, 洼内河链不得互相产生子流域边界)
+    let mut closed_region = hydro.deep_sink.clone();
+    {
+        let mut stack: Vec<usize> = (0..n).filter(|&i| hydro.deep_sink[i]).collect();
+        while let Some(i) = stack.pop() {
+            for j in reverse_neighbours(i, w, h) {
+                if !closed_region[j] && hydro.flow_to[j] == i as u32 {
+                    closed_region[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+
+    // 1) 河网链标注: 拓扑序上每像元继承最大上游河链, 源头开新链;
+    // 深洼区内的河链统一为同一洼地链
     let mut next_chain = 1u32;
+    const CLOSED_CHAIN: u32 = u32::MAX - 1;
     let mut chain_of = vec![0u32; n];
     for &pi in &hydro.pop_order {
         let i = pi as usize;
         if !stream[i] {
+            continue;
+        }
+        if closed_region[i] {
+            chain_of[i] = CLOSED_CHAIN;
             continue;
         }
         let mut best: (u32, u32) = (0, 0); // (acc, chain)
@@ -167,24 +188,22 @@ pub fn build_ridges(
         strength[i] = s;
     }
 
-    // 补充像元: 强度达标且(靠近主分水 或 图内无主分水)
+    // 补充像元: 强度达标且(靠近主分水 或 图内无主分水 或 三证据俱全)。
+    // 三证据俱全(strength>=0.999)的强脊独立保留, 如环状盆缘的分水;
+    // 其余强证据像元须靠近主分水, 防平地噪声扩张成脊(规格 8.2)
     let has_divide = mask.iter().any(|&b| b);
-    if has_divide {
-        let (src, dist) = edt_with_index(&mask, w, h);
-        let _ = src;
-        let max_gap_m = (0.1 * median_scale(pyramid)).min(250.0);
-        let max_gap_px = (max_gap_m / hydro.shape.resolution_m).ceil() as f32;
-        for i in 0..n {
-            if !mask[i] && strength[i] >= 0.7 && valid[i] && !stream[i]
-                && dist[i] <= max_gap_px {
-                    mask[i] = true;
-                }
-        }
-    } else {
-        for i in 0..n {
-            if !mask[i] && strength[i] >= 0.7 && valid[i] && !stream[i] {
-                mask[i] = true;
-            }
+    let (src, dist) = edt_with_index(&mask, w, h);
+    let _ = src;
+    let max_gap_m = (0.1 * median_scale(pyramid)).min(250.0);
+    let max_gap_px = (max_gap_m / hydro.shape.resolution_m).ceil() as f32;
+    for i in 0..n {
+        if !mask[i]
+            && strength[i] >= 0.7
+            && valid[i]
+            && !stream[i]
+            && (!has_divide || dist[i] <= max_gap_px || strength[i] >= 0.999)
+        {
+            mask[i] = true;
         }
     }
 
