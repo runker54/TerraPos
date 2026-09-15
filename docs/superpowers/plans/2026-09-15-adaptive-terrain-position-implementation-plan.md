@@ -290,7 +290,7 @@ git commit -m "feat: validate projected DEM input and preserve nodata"
 - Modify: `rust/topo_core/src/hydro.rs`
 - Create: `rust/topo_core/tests/hydrology.rs`
 
-- [ ] **Step 1: Write failing route and HAND tests**
+- [x] **Step 1: Write failing route and HAND tests**
 
 Cover: every routed cell reaches an outlet or recorded deep sink in at most `n` steps; accumulation is non-decreasing downstream; stream masks are nested from 0.05 to 5.00 km²; HAND is exactly zero on stream cells; an upslope cell receives elevation relative to the first stream encountered along `flow_to`, not the Euclidean-nearest stream; conditioning depth never exceeds the z-limit.
 
@@ -305,13 +305,13 @@ fn hand_follows_flow_connected_stream() {
 }
 ```
 
-- [ ] **Step 2: Run and confirm failure**
+- [x] **Step 2: Run and confirm failure**
 
 Run: `cd rust; cargo test --release --test hydrology`
 
 Expected: missing `HydroConfig`, `HydroModel`, `build_hydro`, and `hand_to_stream`.
 
-- [ ] **Step 3: Replace the monolithic hydrology result with explicit products**
+- [x] **Step 3: Replace the monolithic hydrology result with explicit products**
 
 ```rust
 #[derive(Debug, Clone)]
@@ -339,21 +339,21 @@ pub fn hand_to_stream(dem: &[f32], flow_to: &[u32], stream: &[bool], valid: &[bo
 
 Downsample the hydrological surface to `coarse_res_m` with a valid-aware block minimum/mean hybrid: use the block minimum as drainage support and clamp it no lower than `block_mean - z_limit_m`. Apply bounded Priority-Flood. Cells requiring more than `z_limit_m` of raising stay `deep_sink=true`; they are allowed outlets, not flattened basins.
 
-- [ ] **Step 4: Derive stream thresholds from physical area**
+- [x] **Step 4: Derive stream thresholds from physical area**
 
 For each threshold compute `ceil(area_km2 * 1_000_000 / coarse_cell_area_m2)` once. Sort and validate strictly increasing configuration. `stream_level` is 0 off-stream and 1–4 for the finest-to-coarsest nested level a cell reaches. Reject a threshold that maps below one cell or exceeds valid area.
 
-- [ ] **Step 5: Implement memoized downstream HAND**
+- [x] **Step 5: Implement memoized downstream HAND**
 
 Trace downstream until reaching the first stream cell, outlet, deep sink, or already-solved cell; unwind the stack once. On stream, HAND is 0. At an outlet/deep sink without a stream encounter, HAND is Float32 NoData. Clamp small negative numerical values to zero but return an error when a negative value is below `-0.05 m`, because that indicates inconsistent surfaces or routing.
 
-- [ ] **Step 6: Run tests and existing hydro users**
+- [x] **Step 6: Run tests and existing hydro users**
 
 Run: `cd rust; cargo test --release --test hydrology; cargo test --release hydro::`
 
 Expected: all hydrology tests pass; compile errors in legacy pipeline are acceptable until Task 12, but library unit tests must compile by temporarily retaining only the existing `fill_and_route` wrapper if another untouched example still imports it. This wrapper must be deleted in Task 12, not shipped as a compatibility path.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add rust/topo_core/src/hydro.rs rust/topo_core/tests/hydrology.rs

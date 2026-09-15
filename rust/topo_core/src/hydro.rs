@@ -119,6 +119,231 @@ pub fn stream_mask(acc: &[u32], threshold: u32) -> Vec<bool> {
     acc.iter().map(|&a| a >= threshold).collect()
 }
 
+// ---------------- 新管线: 有界修正 + 嵌套河网 + 流向 HAND ----------------
+
+use crate::error::{CoreError, Result};
+use crate::input::{PreparedDem, RasterShape};
+
+/// 水文构建配置(全部物理单位, 消费边界一次换算)
+#[derive(Debug, Clone)]
+pub struct HydroConfig {
+    /// 粗层分辨率(米)
+    pub coarse_res_m: f64,
+    /// 最大直接填深(米), 超限洼地为合法内流区
+    pub z_limit_m: f32,
+    /// 嵌套河网等级(平方千米, 严格递增)
+    pub stream_areas_km2: [f64; 4],
+}
+
+/// 水文模型产品(粗层网格)
+#[derive(Debug, Clone)]
+pub struct HydroModel {
+    /// 有界修正后表面
+    pub conditioned: Vec<f32>,
+    /// 修正抬升量(米, 恒 <= z_limit; 深洼处为 0)
+    pub conditioning_depth: Vec<f32>,
+    /// 每像元下游一维索引(出口指向自身)
+    pub flow_to: Vec<u32>,
+    /// Priority-Flood 弹出顺序(拓扑序)
+    pub pop_order: Vec<u32>,
+    /// 汇流累积像元数(含自身)
+    pub accumulation_cells: Vec<u32>,
+    /// 超限深洼像元(内流区)
+    pub deep_sink: Vec<bool>,
+    /// 四级河网掩膜(细 -> 粗)
+    pub streams: [Vec<bool>; 4],
+    /// 0=非河网, 1..=4=该像元达到的最细->最粗嵌套等级
+    pub stream_level: Vec<u8>,
+    pub shape: RasterShape,
+}
+
+/// 构建水文模型: 米制下采样(valid-aware 最小/均值混合) -> 有界 Priority-Flood
+/// -> D8 路由 -> 物理面积阈值嵌套河网。
+pub fn build_hydro(prepared: &PreparedDem, cfg: &HydroConfig) -> Result<HydroModel> {
+    let native = prepared.shape;
+    let (coarse, coarse_valid, shape) =
+        downsample_bounded(&prepared.raw, &prepared.valid, native, cfg.coarse_res_m, cfg.z_limit_m);
+    // 无效粗像元给虚拟排水低值: 有效水流在 NoData 边界自然排出,
+    // 不会在无效区内产生伪洼地; 无效区路由结果由下游掩膜过滤。
+    let vmin = coarse
+        .iter()
+        .zip(coarse_valid.iter())
+        .filter(|&(_, &v)| v)
+        .map(|(&z, _)| z)
+        .fold(f32::INFINITY, f32::min);
+    let fill_value = if vmin.is_finite() { vmin - 1000.0 } else { 0.0 };
+    let routed: Vec<f32> = coarse
+        .iter()
+        .zip(coarse_valid.iter())
+        .map(|(&z, &v)| if v { z } else { fill_value })
+        .collect();
+    let fr = fill_and_route(&routed, shape.width, shape.height, cfg.z_limit_m);
+
+    let conditioning_depth: Vec<f32> = fr
+        .filled
+        .iter()
+        .zip(coarse.iter())
+        .map(|(&f, &z)| if f > z { f - z } else { 0.0 })
+        .collect();
+
+    // 物理面积阈值 -> 粗层像元数(一次换算), 严格递增校验
+    let cell_area = cfg.coarse_res_m * cfg.coarse_res_m;
+    let ths: Vec<u32> = cfg
+        .stream_areas_km2
+        .iter()
+        .map(|&a| (a * 1_000_000.0 / cell_area).ceil() as u32)
+        .collect();
+    for w in ths.windows(2) {
+        if w[0] == 0 || w[0] >= w[1] {
+            return Err(CoreError::Invalid(format!(
+                "河网面积阈值必须严格递增且大于一个像元面积 (观测 {:?} km²)",
+                cfg.stream_areas_km2
+            )));
+        }
+    }
+    let mut streams: [Vec<bool>; 4] = Default::default();
+    for (k, &th) in ths.iter().enumerate() {
+        streams[k] = fr.acc.iter().map(|&a| a >= th).collect();
+    }
+    let stream_level: Vec<u8> = fr
+        .acc
+        .iter()
+        .map(|&a| {
+            let mut lv = 0u8;
+            for (k, &th) in ths.iter().enumerate() {
+                if a >= th {
+                    lv = k as u8 + 1;
+                }
+            }
+            lv
+        })
+        .collect();
+
+    Ok(HydroModel {
+        conditioned: fr.filled,
+        conditioning_depth,
+        flow_to: fr.flow_to,
+        pop_order: fr.pop_order,
+        accumulation_cells: fr.acc,
+        deep_sink: fr.is_deep_sink,
+        streams,
+        stream_level,
+        shape,
+    })
+}
+
+/// valid-aware 米制块下采样: 块最小值保证排水支持, 但不深于均值 - z_limit。
+fn downsample_bounded(
+    dem: &[f32],
+    valid: &[bool],
+    native: RasterShape,
+    coarse_res_m: f64,
+    z_limit_m: f32,
+) -> (Vec<f32>, Vec<bool>, RasterShape) {
+    let cw = ((native.width as f64 * native.resolution_m / coarse_res_m).ceil() as usize).max(1);
+    let ch = ((native.height as f64 * native.resolution_m / coarse_res_m).ceil() as usize).max(1);
+    let mut out = vec![0f32; cw * ch];
+    let mut out_valid = vec![false; cw * ch];
+    let edge = |i: usize, total: usize| -> (usize, usize) {
+        let s = ((i as f64 * coarse_res_m / native.resolution_m).round() as usize).min(total);
+        let e = (((i + 1) as f64 * coarse_res_m / native.resolution_m).round() as usize)
+            .min(total)
+            .max(s + 1);
+        (s, e)
+    };
+    for cy in 0..ch {
+        let (y0, y1) = edge(cy, native.height);
+        for cx in 0..cw {
+            let (x0, x1) = edge(cx, native.width);
+            let mut min_v = f32::MAX;
+            let mut sum = 0f64;
+            let mut cnt = 0u32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = y * native.width + x;
+                    if valid[i] {
+                        min_v = min_v.min(dem[i]);
+                        sum += dem[i] as f64;
+                        cnt += 1;
+                    }
+                }
+            }
+            if cnt > 0 {
+                let mean = (sum / cnt as f64) as f32;
+                out[cy * cw + cx] = min_v.max(mean - z_limit_m);
+                out_valid[cy * cw + cx] = true;
+            }
+        }
+    }
+    (out, out_valid, RasterShape { width: cw, height: ch, resolution_m: coarse_res_m })
+}
+
+/// 沿 flow_to 链寻找第一个河网像元的记忆化 HAND。
+/// 河网像元 HAND=0; 链上无河网(直排出口/深洼)时 HAND 为 Float32 NoData(NaN);
+/// 负值 < -0.05 m 视为表面/路由不一致并报错, 微小数值负值截为 0。
+pub fn hand_to_stream(
+    dem: &[f32],
+    flow_to: &[u32],
+    stream: &[bool],
+    valid: &[bool],
+) -> Result<Vec<f32>> {
+    let n = dem.len();
+    debug_assert_eq!(n, flow_to.len());
+    let mut hand = vec![f32::NAN; n];
+    // 已解像元的下游首河网索引; u32::MAX = 沿链无河网
+    let mut anchor = vec![u32::MAX; n];
+    let mut done = vec![false; n];
+    for s0 in 0..n {
+        if !valid[s0] || done[s0] {
+            continue;
+        }
+        let mut path: Vec<u32> = Vec::new();
+        let mut cur = s0;
+        let mut res_anchor = u32::MAX;
+        loop {
+            if done[cur] {
+                res_anchor = anchor[cur];
+                break;
+            }
+            if stream[cur] {
+                res_anchor = cur as u32;
+                hand[cur] = 0.0;
+                anchor[cur] = cur as u32;
+                done[cur] = true;
+                break;
+            }
+            if flow_to[cur] == cur as u32 {
+                break; // 出口: 沿链无河网
+            }
+            path.push(cur as u32);
+            cur = flow_to[cur] as usize;
+        }
+        for &p in &path {
+            let p = p as usize;
+            done[p] = true;
+            anchor[p] = res_anchor;
+            hand[p] = if res_anchor == u32::MAX {
+                f32::NAN
+            } else {
+                dem[p] - dem[res_anchor as usize]
+            };
+        }
+    }
+    for &v in hand.iter() {
+        if v < -0.05 {
+            return Err(CoreError::Invalid(format!(
+                "HAND 出现 {v} m 的负值, 地貌/水文表面或路由不一致"
+            )));
+        }
+    }
+    for v in hand.iter_mut() {
+        if *v < 0.0 {
+            *v = 0.0;
+        }
+    }
+    Ok(hand)
+}
+
 
 /// 验证辅助: 对 flow_to 森林计算每节点的子树大小(含自身)
 #[cfg(test)]
