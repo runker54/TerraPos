@@ -328,7 +328,7 @@ pub fn write_u32<P: AsRef<Path>>(
     let mut enc = tiff::encoder::TiffEncoder::new(BufWriter::new(file))?;
     {
         let mut img = enc.new_image::<colortype::Gray32>(meta.width, meta.height)?;
-        write_geo_tags(&mut img.encoder(), meta)?;
+        write_geo_tags(img.encoder(), meta)?;
         img.write_data(data)?;
     }
     Ok(())

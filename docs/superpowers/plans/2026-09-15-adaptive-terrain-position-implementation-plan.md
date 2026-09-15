@@ -1055,7 +1055,7 @@ git commit -m "feat: integrate adaptive dem-only terrain pipeline"
 - Create: `rust/topo_core/tests/parameter_effects.rs`
 - Modify: `rust/topo_core/src/pipeline.rs`
 
-- [ ] **Step 1: Add one sensitivity test per visible setting**
+- [x] **Step 1: Add one sensitivity test per visible setting**
 
 Use the same deterministic mixed terrain. Required assertions:
 
@@ -1066,13 +1066,13 @@ Use the same deterministic mixed terrain. Required assertions:
 - `write_diagnostics` changes file emission only, not terrain codes.
 - changing `hydro_z_limit_m`, growth threshold, low-relief threshold, hill elevation threshold, or stream thresholds changes its named intermediate layer or expected final zoning.
 
-- [ ] **Step 2: Run and confirm any dead parameter fails**
+- [x] **Step 2: Run and confirm any dead parameter fails**
 
 Run: `cd rust; cargo test --release --test parameter_effects`
 
 Expected before adjustment: at least one assertion exposes any still-unused field.
 
-- [ ] **Step 3: Centralize preset resolution**
+- [x] **Step 3: Centralize preset resolution**
 
 Add `Params::resolved() -> Result<ResolvedParams>`. Map presets exactly:
 
@@ -1084,7 +1084,7 @@ Add `Params::resolved() -> Result<ResolvedParams>`. Map presets exactly:
 
 Advanced non-default values override only their matching resolved field. Validate ordered stream thresholds, `0.05≤growth_threshold≤0.40`, `0≤postprocess_strength≤2`, and positive physical distances/areas.
 
-- [ ] **Step 4: Run and commit**
+- [x] **Step 4: Run and commit**
 
 Run: `cd rust; cargo test --release --test parameter_effects`
 

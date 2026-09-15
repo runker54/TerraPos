@@ -36,7 +36,7 @@ pub fn compose_codes(
         if !valid[i] {
             continue;
         }
-        if basin.mask[i] {
+        if basin.mask.get(i).copied().unwrap_or(false) {
             terrain[i] = 1;
             subclass[i] = 7;
             confidence[i] = 1.0;

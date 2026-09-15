@@ -192,6 +192,9 @@ pub struct ArrayOutputs {
     pub stats: Vec<(u8, f64)>,
     pub report: String,
     pub native_shape: RasterShape,
+    /// 诊断层网格(粗层)
+    pub coarse_shape: RasterShape,
+    pub coarse_meta: GeoMeta,
 }
 
 /// 检查取消
@@ -216,7 +219,7 @@ pub fn run_arrays_for_test(
 /// 数组级管线主体
 pub fn run_arrays(
     dem: &[f32],
-    valid: &[bool],
+    _valid: &[bool],
     shape: RasterShape,
     params: &Params,
     cancelled: &AtomicBool,
@@ -239,7 +242,6 @@ pub fn run_arrays(
     let prepared = prepare_values(dem.to_vec(), demo_meta(shape)?, &InputConfig::default())?;
     let resolved = params.resolved_with(prepared.shape.resolution_m);
     stage_times.push(("输入与双表面".into(), t0.elapsed().as_secs_f32()));
-    drop(dem);
 
     // ---- 3 水文 ----
     t0 = std::time::Instant::now();
@@ -411,6 +413,21 @@ pub fn run_arrays(
     );
     say(88.0, "完成", "分析网格就绪")?;
 
+    let mut coarse_meta = demo_meta(hydro.shape)?;
+    coarse_meta.geo_keys = prepared.meta.geo_keys.clone();
+    coarse_meta.geo_ascii = prepared.meta.geo_ascii.clone();
+    coarse_meta.pixel_scale = [
+        resolved.coarse_res_m,
+        resolved.coarse_res_m,
+        0.0,
+    ];
+    coarse_meta.tiepoint = {
+        let mut t = prepared.meta.tiepoint;
+        t[3] += resolved.coarse_res_m / 2.0;
+        t[4] -= resolved.coarse_res_m / 2.0;
+        t
+    };
+
     Ok(ArrayOutputs {
         terrain,
         geomorph_subclass: subclass,
@@ -419,6 +436,8 @@ pub fn run_arrays(
         stats,
         report,
         native_shape: shape,
+        coarse_shape: hydro.shape,
+        coarse_meta,
     })
 }
 
@@ -640,17 +659,18 @@ pub fn run(
         let d = out_dir.join("diagnostics");
         std::fs::create_dir_all(&d)?;
         let dg = &out.diagnostics;
-        geotiff::write_f32(d.join("hydro_conditioning_depth.tif"), &meta5, &dg.hydro_conditioning_depth)?;
-        geotiff::write_u8_cmap(d.join("stream_level.tif"), &meta5, &dg.stream_level, &cmap)?;
-        geotiff::write_u8_cmap(d.join("ridge_mask.tif"), &meta5, &dg.ridge_mask, &cmap)?;
-        geotiff::write_u32(d.join("slope_unit.tif"), &meta5, &dg.slope_unit)?;
-        geotiff::write_f32(d.join("adaptive_scale_m.tif"), &meta5, &dg.adaptive_scale_m)?;
-        geotiff::write_f32(d.join("hand_m.tif"), &meta5, &dg.hand_m)?;
-        geotiff::write_f32(d.join("relative_position.tif"), &meta5, &dg.relative_position)?;
-        geotiff::write_u8_cmap(d.join("slope_position_raw.tif"), &meta5, &dg.slope_position_raw, &cmap)?;
-        geotiff::write_u8_cmap(d.join("basin_candidate.tif"), &meta5, &dg.basin_candidate, &cmap)?;
-        geotiff::write_u8_cmap(d.join("basin_core.tif"), &meta5, &dg.basin_core, &cmap)?;
-        geotiff::write_u8_cmap(d.join("basin_mask.tif"), &meta5, &dg.basin_mask, &cmap)?;
+        let cmeta = &out.coarse_meta;
+        geotiff::write_f32(d.join("hydro_conditioning_depth.tif"), cmeta, &dg.hydro_conditioning_depth)?;
+        geotiff::write_u8_cmap(d.join("stream_level.tif"), cmeta, &dg.stream_level, &cmap)?;
+        geotiff::write_u8_cmap(d.join("ridge_mask.tif"), cmeta, &dg.ridge_mask, &cmap)?;
+        geotiff::write_u32(d.join("slope_unit.tif"), cmeta, &dg.slope_unit)?;
+        geotiff::write_f32(d.join("adaptive_scale_m.tif"), cmeta, &dg.adaptive_scale_m)?;
+        geotiff::write_f32(d.join("hand_m.tif"), cmeta, &dg.hand_m)?;
+        geotiff::write_f32(d.join("relative_position.tif"), cmeta, &dg.relative_position)?;
+        geotiff::write_u8_cmap(d.join("slope_position_raw.tif"), cmeta, &dg.slope_position_raw, &cmap)?;
+        geotiff::write_u8_cmap(d.join("basin_candidate.tif"), cmeta, &dg.basin_candidate, &cmap)?;
+        geotiff::write_u8_cmap(d.join("basin_core.tif"), cmeta, &dg.basin_core, &cmap)?;
+        geotiff::write_u8_cmap(d.join("basin_mask.tif"), cmeta, &dg.basin_mask, &cmap)?;
     }
     Ok(Outputs {
         terrain: out.terrain,
