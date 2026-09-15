@@ -53,37 +53,29 @@ pub fn build_ridges(
         }
     }
 
-    // 1) 河网链标注: 拓扑序上每像元继承最大上游河链, 源头开新链;
-    // 深洼区内的河链统一为同一洼地链
-    let mut next_chain = 1u32;
-    const CLOSED_CHAIN: u32 = u32::MAX - 1;
+    // 1) 河网链标注: 河网连通体(8 连通)为一条链 —— 网状/辫状河带
+    // 属同一排水系统, 按流向继承会在横带上退化为每像元一链
     let mut chain_of = vec![0u32; n];
-    for &pi in &hydro.pop_order {
-        let i = pi as usize;
-        if !stream[i] {
-            continue;
-        }
-        if closed_region[i] {
-            chain_of[i] = CLOSED_CHAIN;
-            continue;
-        }
-        let mut best: (u32, u32) = (0, 0); // (acc, chain)
-        for j in reverse_neighbours(i, w, h) {
-            if hydro.flow_to[j] == i as u32 && stream[j] {
-                let a = hydro.accumulation_cells[j];
-                if a > best.0 {
-                    best = (a, chain_of[j]);
+    let mut next_chain = 1u32;
+    {
+        let mut stack: Vec<usize> = Vec::new();
+        for s0 in 0..n {
+            if !stream[s0] || chain_of[s0] != 0 {
+                continue;
+            }
+            let c = next_chain;
+            next_chain += 1;
+            chain_of[s0] = c;
+            stack.push(s0);
+            while let Some(i) = stack.pop() {
+                for j in reverse_neighbours(i, w, h) {
+                    if stream[j] && chain_of[j] == 0 {
+                        chain_of[j] = c;
+                        stack.push(j);
+                    }
                 }
             }
         }
-        let cid = if best.1 == 0 {
-            let c = next_chain;
-            next_chain += 1;
-            c
-        } else {
-            best.1
-        };
-        chain_of[i] = cid;
     }
 
     // 2) 子流域竞争泛洪: 河链像元为多源种子, 反向 BFS 就近归属
@@ -124,12 +116,18 @@ pub fn build_ridges(
             if !valid[i] || stream[i] || sub[i] == 0 || dist_stream[i] <= 2.0 {
                 continue;
             }
+            // 分水线必然局部高于邻域(NDEV>0): 平行流的算法伪接触
+            // (无横向起伏)不产生边界
+            if ndev_at(pyramid, pyramid.characteristic_scale_m[i], i) <= 0.0 {
+                continue;
+            }
             for j in reverse_neighbours(i, w, h) {
                 if valid[j]
                     && !stream[j]
                     && sub[j] != 0
                     && sub[j] != sub[i]
                     && dist_stream[j] > 2.0
+                    && ndev_at(pyramid, pyramid.characteristic_scale_m[j], j) > 0.0
                 {
                     mask[i] = true;
                     mask[j] = true;
@@ -167,7 +165,21 @@ pub fn build_ridges(
         })
         .collect();
     let inv_route = crate::hydro::fill_and_route(&inv_dem, w, h, 99999.0);
-    let inv_threshold = 80u32.max((n / 10_000) as u32);
+    // 反地形汇流阈值取有效像元的 P95: 真脊线是反地形汇流的高分位,
+    // 固定小阈值会把对称坡的"反地形汇流横带"误判为脊
+    let inv_threshold = {
+        let mut sample: Vec<u32> = inv_route
+            .acc
+            .iter()
+            .zip(valid.iter())
+            .filter(|&(_, &v)| v)
+            .step_by(16)
+            .map(|(&a, _)| a)
+            .collect();
+        sample.sort_unstable();
+        let p95 = sample[(sample.len() as f32 * 0.95) as usize % sample.len()];
+        p95.max(80)
+    };
     for i in 0..n {
         if !valid[i] || stream[i] {
             continue;
@@ -260,14 +272,18 @@ fn reverse_neighbours(i: usize, w: usize, h: usize) -> Vec<usize> {
     out
 }
 
-/// 取特征尺度对应层的 NDEV
+/// 取特征尺度对应层(最近层)的 NDEV
 fn ndev_at(pyramid: &ScalePyramid, scale_m: f32, i: usize) -> f32 {
+    let mut best = &pyramid.layers[0];
+    let mut bd = f32::INFINITY;
     for layer in &pyramid.layers {
-        if layer.radius_m as f32 == scale_m {
-            return layer.normalized_deviation[i];
+        let d = (layer.radius_m as f32 - scale_m).abs();
+        if d < bd {
+            bd = d;
+            best = layer;
         }
     }
-    0.0
+    best.normalized_deviation[i]
 }
 
 /// 全图特征尺度中位数(米)

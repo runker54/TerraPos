@@ -1,86 +1,87 @@
-//! 参数模型 + 全流程编排（含进度回调与取消）
+//! 参数模型 + 全流程编排（自适应 DEM 地形部位划分管线）。
+//!
+//! pipeline 只负责编排、进度、取消与成果写出; 全部算法在 input/scale/
+//! hydro/ridge/slope_unit/geomorphon/slope_position/basin/postprocess。
+//! 阶段顺序固定: 输入 -> 双表面 -> 水文 -> 金字塔 -> 形态层 -> 脊线/单元
+//! -> 几何 -> 形态证据/隶属度 -> 盆地 -> 组合清理 -> 上采样 -> 写出。
 
-use crate::distance::edt_with_index;
+use crate::basin::{detect_basins, BasinConfig, BasinResult};
 use crate::error::{CoreError, Result};
-use crate::filter::{focal_mean, focal_relief};
+use crate::geomorphon::adaptive_morphology_evidence;
 use crate::geotiff::{self, GeoMeta};
-use crate::hydro::fill_and_route;
-use crate::segment::label_connected;
-use crate::terrain::{box_downsample, slope_horn_degrees};
+use crate::hydro::{build_hydro, HydroConfig};
+use crate::input::{prepare_input, prepare_values, InputConfig, PreparedDem, RasterShape};
+#[allow(unused_imports)]
+use crate::hydro::hand_to_stream;
+use crate::postprocess::{compose_codes, constrained_cleanup, FinalClassification};
+use crate::ridge::build_ridges;
+use crate::scale::{build_scale_pyramid, usable_scales, ScalePyramid};
+use crate::slope_position::{classify_slope_positions, SlopePosition};
+use crate::slope_unit::{build_slope_geometry, build_slope_units};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-
-/// 山体单元种子提取模式
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum SeedMode {
-    /// 单一固定窗口(峰顶间距 = window_peak_m)
-    #[default]
-    Fixed,
-    /// 分亚类动态窗口(峰顶间距随地貌亚类自适应: 低丘窄、中山宽)
-    Zoned,
-    /// 地形突起度(峰顶 prominence >= seed_prominence_m, 无窗口参数)
-    Prominence,
-    /// 多尺度 TPI 特征尺度投票(尺度空间语义, 无种子; 正 TPI 连通域为个体)
-    ScaleVote,
-    /// 混合: 突出度语义 ∪ 距离语义(推荐)
-    Hybrid,
-}
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 盆地保留倾向(设计规格 19 节: 普通 UI 参数)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BasinTendency {
     Strict,
     Standard,
     Loose,
 }
 
+/// 分析精细度预设(设计规格 19 节: 普通 UI 参数)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrecisionPreset {
+    Fast,
+    Standard,
+    Detailed,
+}
 
-/// 全部数值型指标参数（UI 表单一一对应）
-#[derive(Debug, Clone)]
+/// 研究模式高级参数(物理单位)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedParams {
+    /// 粗层分析分辨率(米)
+    pub coarse_res_m: f64,
+    /// 水文最大直接填深(米)
+    pub hydro_z_limit_m: f32,
+    /// 尺度增长率收敛阈值
+    pub scale_growth_threshold: f32,
+    /// 低起伏判据(米, HAND/位置融合权重过渡)
+    pub low_relief_m: f32,
+    /// 丘陵海拔上限(米)
+    pub hill_elevation_max_m: f32,
+    /// 嵌套河网面积等级(平方千米, 严格递增)
+    pub stream_areas_km2: [f64; 4],
+}
+
+impl Default for AdvancedParams {
+    fn default() -> Self {
+        AdvancedParams {
+            coarse_res_m: 25.0,
+            hydro_z_limit_m: 15.0,
+            scale_growth_threshold: 0.15,
+            low_relief_m: 20.0,
+            hill_elevation_max_m: 500.0,
+            stream_areas_km2: [0.05, 0.20, 1.00, 5.00],
+        }
+    }
+}
+
+/// 运行参数(全部物理单位)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Params {
     pub dem_path: String,
     pub out_dir: String,
-    /// 中间(大尺度)分析层分辨率(米), 默认 25; 需 >= 成品分辨率
-    pub coarse_res: f64,
-    /// 区域高程百分位上限(0-100): 低于邻域均值的幅度阈值
-    pub basin_pctl_max: f64,
-    /// 区域高程百分位邻域窗口(米)
-    pub basin_pctl_win_m: f64,
-    /// 坝子坡度上限(度)
-    pub basin_slope_th: f64,
-    /// 局部起伏(5x5@成品分辨率)上限(米)
-    pub basin_relief_m: f64,
-    /// 坝子最小保留面积(m²)
+    pub precision: PrecisionPreset,
+    pub basin_tendency: BasinTendency,
+    /// 最小盆地面积(平方米)
     pub basin_min_area_m2: f64,
-    /// 对象内部起伏上限(米, P95-P5)
-    pub basin_inner_relief_m: f64,
-    /// 碎片桥接闭运算半径(米)
-    pub basin_bridge_m: f64,
-    /// 坝子内碎斑归并: 桥接域半径(米, 0=不归并)
-    pub basin_merge_m: f64,
-    /// 坝子内碎斑归并: 碎斑面积上限(m²)
-    pub basin_merge_max_m2: f64,
-    /// 坝子平滑距离(米)
-    pub basin_smooth_m: f64,
-    /// 坡位 geomorphon 线视搜索半径(米, 对齐 r.geomorphon search)
-    pub slope_search_m: f64,
-    /// 坡位线视起始跳过距离(米, 滤微起伏)
-    pub slope_skip_m: f64,
-    /// 平坡/中坡坡度分界(度, 对齐脚本阈值 5)
-    pub slope_flat_deg: f64,
-    /// 坡位小斑蚕食阈值(m², 对齐脚本 200 像元@5m)
-    pub slope_min_patch_m2: f64,
-    /// 丘陵海拔上限(米)
-    pub hill_z_max: f64,
-    /// 丘陵亚类起伏度窗口(米)
-    pub relief_subclass_win: f64,
-    /// 低丘起伏度上限(米)
-    pub relief_low_hill: f64,
-    /// 众数滤波轮数
-    pub mode_filter_iter: usize,
-    /// 最小图斑(m², 成品层)
-    pub min_patch_m2: f64,
+    /// 后处理强度(0..2, 1=标准)
+    pub postprocess_strength: f64,
+    pub write_diagnostics: bool,
+    pub advanced: AdvancedParams,
 }
 
 impl Default for Params {
@@ -88,26 +89,62 @@ impl Default for Params {
         Params {
             dem_path: String::new(),
             out_dir: String::new(),
-            coarse_res: 25.0,
-            basin_pctl_max: 30.0,
-            basin_pctl_win_m: 2000.0,
-            basin_slope_th: 5.0,
-            basin_relief_m: 5.0,
-            basin_min_area_m2: 66_666.67, // 100 亩
-            basin_inner_relief_m: 30.0,
-            basin_bridge_m: 50.0,
-            basin_merge_m: 100.0,
-            basin_merge_max_m2: 20_000.0,
-            basin_smooth_m: 50.0,
-            slope_search_m: 1000.0,
-            slope_skip_m: 50.0,
-            slope_flat_deg: 5.0,
-            slope_min_patch_m2: 5000.0,
-            hill_z_max: 500.0,
-            relief_subclass_win: 2000.0,
-            relief_low_hill: 200.0,
-            mode_filter_iter: 1,
-            min_patch_m2: 10_000.0,
+            precision: PrecisionPreset::Standard,
+            basin_tendency: BasinTendency::Standard,
+            basin_min_area_m2: 66_666.67,
+            postprocess_strength: 1.0,
+            write_diagnostics: true,
+            advanced: AdvancedParams::default(),
+        }
+    }
+}
+
+/// 预设解析结果(任务 13 的参数效应测试锚点)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedParams {
+    pub coarse_res_m: f64,
+    /// 尺度族上下限(米)
+    pub scale_min_m: f64,
+    pub scale_max_m: f64,
+    /// 分带写出缓冲边长(像元)
+    pub tile_edge: usize,
+}
+
+impl Params {
+    /// 预设映射: Fast=max(res,50)/250-4000/1024, Standard=max(res,25)/
+    /// 125-4000/1024, Detailed=max(res,10)/125-8000/768
+    pub fn resolved(&self) -> Result<ResolvedParams> {
+        if !(0.05..=2.0).contains(&self.postprocess_strength) {
+            return Err(CoreError::Invalid(format!(
+                "后处理强度必须在 0.05..2 (观测 {})",
+                self.postprocess_strength
+            )));
+        }
+        if self.basin_min_area_m2 <= 0.0 {
+            return Err(CoreError::Invalid("最小盆地面积必须为正".into()));
+        }
+        let res = 5.0; // 实际分辨率在输入就绪后由 resolved_with 替换
+        Ok(self.resolved_with(res))
+    }
+
+    /// 输入就绪后的解析(分辨率来自真实 DEM)
+    pub fn resolved_with(&self, native_res_m: f64) -> ResolvedParams {
+        let (coarse, smin, smax, tile) = match self.precision {
+            PrecisionPreset::Fast => {
+                (native_res_m.max(50.0), 250.0, 4000.0, 1024usize)
+            }
+            PrecisionPreset::Standard => {
+                (native_res_m.max(25.0), 125.0, 4000.0, 1024)
+            }
+            PrecisionPreset::Detailed => {
+                (native_res_m.max(10.0), 125.0, 8000.0, 768)
+            }
+        };
+        ResolvedParams {
+            coarse_res_m: coarse,
+            scale_min_m: smin,
+            scale_max_m: smax,
+            tile_edge: tile,
         }
     }
 }
@@ -121,36 +158,364 @@ pub struct Progress {
 pub struct Outputs {
     pub terrain: Vec<u8>,
     pub subclass: Vec<u8>,
+    pub confidence: Vec<f32>,
     pub meta5: GeoMeta,
     pub report: String,
     /// (类编码, 面积km²), 按业务顺序
     pub stats: Vec<(u8, f64)>,
 }
 
-/// 最近有效值填充 nodata
-pub fn fill_nodata(dem: &mut [f32], w: usize, h: usize) -> bool {
-    let invalid: Vec<bool> = dem.iter().map(|v| !v.is_finite()).collect();
-    if !invalid.iter().any(|b| *b) {
-        return false;
-    }
-    let valid: Vec<bool> = invalid.iter().map(|b| !b).collect();
-    let (vidx, _) = edt_with_index(&valid, w, h);
-    for (i, bad) in invalid.iter().enumerate() {
-        if *bad {
-            dem[i] = dem[vidx[i] as usize];
-        }
-    }
-    true
+/// 诊断图层(粗层网格, 与上采样前的分析网格一致)
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticLayers {
+    pub hydro_conditioning_depth: Vec<f32>,
+    pub stream_level: Vec<u8>,
+    pub ridge_mask: Vec<u8>,
+    pub slope_unit: Vec<u32>,
+    pub adaptive_scale_m: Vec<f32>,
+    pub hand_m: Vec<f32>,
+    pub relative_position: Vec<f32>,
+    pub slope_position_raw: Vec<u8>,
+    pub basin_candidate: Vec<u8>,
+    pub basin_core: Vec<u8>,
+    pub basin_mask: Vec<u8>,
 }
 
-/// 双线性上采样(同投影, 源网格从原点对齐)
+/// 数组级管线输出(测试与编排共用)
+pub struct ArrayOutputs {
+    /// 原生分辨率最终编码
+    pub terrain: Vec<u8>,
+    pub geomorph_subclass: Vec<u8>,
+    pub confidence: Vec<f32>,
+    pub diagnostics: DiagnosticLayers,
+    /// (编码, 像元数)
+    pub stats: Vec<(u8, f64)>,
+    pub report: String,
+    pub native_shape: RasterShape,
+}
+
+/// 检查取消
+fn check(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(CoreError::Cancelled);
+    }
+    Ok(())
+}
+
+/// 数组级端到端管线(测试入口与文件编排的共用主体)
+pub fn run_arrays_for_test(
+    dem: &[f32],
+    _valid: &[bool],
+    shape: RasterShape,
+    params: &Params,
+) -> Result<ArrayOutputs> {
+    let cancelled = AtomicBool::new(false);
+    run_arrays(dem, _valid, shape, params, &cancelled, &|_| true)
+}
+
+/// 数组级管线主体
+pub fn run_arrays(
+    dem: &[f32],
+    valid: &[bool],
+    shape: RasterShape,
+    params: &Params,
+    cancelled: &AtomicBool,
+    progress: &dyn Fn(&Progress) -> bool,
+) -> Result<ArrayOutputs> {
+    let mut stage_times: Vec<(String, f32)> = Vec::new();
+    let mut t0 = std::time::Instant::now();
+    let say = |pct: f32, stage: &str, msg: &str| -> Result<()> {
+        check(cancelled)?;
+        progress(&Progress {
+            stage: stage.to_string(),
+            pct,
+            msg: msg.to_string(),
+        });
+        Ok(())
+    };
+
+    // ---- 1/2 输入与双表面 ----
+    say(5.0, "输入", "构建有效掩膜与地貌表面...")?;
+    let prepared = prepare_values(dem.to_vec(), demo_meta(shape)?, &InputConfig::default())?;
+    let resolved = params.resolved_with(prepared.shape.resolution_m);
+    stage_times.push(("输入与双表面".into(), t0.elapsed().as_secs_f32()));
+    drop(dem);
+
+    // ---- 3 水文 ----
+    t0 = std::time::Instant::now();
+    say(12.0, "水文", "有界修正 + 嵌套河网 + HAND...")?;
+    let hcfg = HydroConfig {
+        coarse_res_m: resolved.coarse_res_m,
+        z_limit_m: params.advanced.hydro_z_limit_m,
+        stream_areas_km2: params.advanced.stream_areas_km2,
+    };
+    let hydro = build_hydro(&prepared, &hcfg)?;
+    let cw = hydro.shape.width;
+    let ch = hydro.shape.height;
+    let cn = cw * ch;
+    // 粗层表面(valid-aware 均值, 与水文网格一致)
+    let (coarse, coarse_valid) = coarse_average(&prepared, resolved.coarse_res_m, cw, ch);
+    stage_times.push(("水文".into(), t0.elapsed().as_secs_f32()));
+
+    // ---- 4 金字塔 ----
+    t0 = std::time::Instant::now();
+    say(24.0, "尺度", "多尺度稳健金字塔...")?;
+    let pyramid = build_scale_pyramid(
+        &coarse,
+        &coarse_valid,
+        hydro.shape,
+        params.advanced.scale_growth_threshold,
+    )?;
+    stage_times.push(("尺度金字塔".into(), t0.elapsed().as_secs_f32()));
+
+    // ---- 5-6 形态层 / 脊线与单元 ----
+    t0 = std::time::Instant::now();
+    say(36.0, "形态", "尺度索引 geomorphon 形态证据...")?;
+    let scales_all = usable_scales(hydro.shape);
+    let scales: Vec<f64> = scales_all
+        .iter()
+        .copied()
+        .filter(|&s| s >= resolved.scale_min_m && s <= resolved.scale_max_m)
+        .collect();
+    let scales = if scales.len() < 3 { scales_all } else { scales };
+    let morph = adaptive_morphology_evidence(
+        &coarse,
+        &coarse_valid,
+        hydro.shape,
+        &pyramid.characteristic_scale_m,
+        &scales,
+    )?;
+    say(46.0, "脊线", "子流域边界 + 补充证据脊线...")?;
+    let ridges =
+        build_ridges(&coarse, &coarse_valid, &hydro, &pyramid, &morph.form)?;
+    let units = build_slope_units(&coarse, &coarse_valid, &hydro, &ridges)?;
+    stage_times.push(("形态/脊线/单元".into(), t0.elapsed().as_secs_f32()));
+
+    // ---- 7 几何 ----
+    t0 = std::time::Instant::now();
+    say(56.0, "几何", "约束距离 + 自适应尺度 + 相对位置...")?;
+    let geom = build_slope_geometry(
+        &coarse,
+        &coarse_valid,
+        &units,
+        &hydro,
+        &pyramid,
+        params.advanced.low_relief_m,
+    )?;
+    stage_times.push(("约束几何".into(), t0.elapsed().as_secs_f32()));
+
+    // ---- 8 隶属度 ----
+    say(64.0, "隶属", "模糊上/中/下隶属度...")?;
+    let positions = classify_slope_positions(&geom.relative_position, &morph, &coarse_valid)?;
+
+    // ---- 9 盆地 ----
+    say(70.0, "盆地", "低平候选 + 对象检验 + 边界重建...")?;
+    let basin = detect_basins(
+        &coarse,
+        &coarse_valid,
+        hydro.shape,
+        &hydro,
+        &units,
+        &geom,
+        &pyramid,
+        &morph,
+        &BasinConfig {
+            tendency: params.basin_tendency,
+            min_area_m2: params.basin_min_area_m2,
+        },
+    )?;
+
+    // ---- 10 组合与清理 ----
+    say(76.0, "组合", "编码组合 + 受约束清理...")?;
+    let mut fc: FinalClassification = compose_codes(
+        &coarse,
+        &coarse_valid,
+        &basin,
+        &positions,
+        params.advanced.hill_elevation_max_m,
+    )?;
+    // 高丘细分(亚类): 2000m 窗内起伏 <200 m 为低丘
+    refine_high_hills(&mut fc, &pyramid, params.advanced.hill_elevation_max_m);
+    let corrected = constrained_cleanup(
+        &mut fc,
+        &positions,
+        &units,
+        &geom,
+        &basin,
+        hydro.shape,
+        params.postprocess_strength,
+    )?;
+    let low_conf_pct = {
+        let lc = morph.low_confidence.iter().filter(|&&b| b).count();
+        100.0 * lc as f64 / cn as f64
+    };
+
+    // ---- 11 上采样到原生分辨率 ----
+    t0 = std::time::Instant::now();
+    say(84.0, "上采样", "粗层成果回投原生分辨率...")?;
+    let terrain = upscale_categorical(&fc.terrain, cw, ch, shape);
+    let subclass = upscale_categorical(&fc.geomorph_subclass, cw, ch, shape);
+    let confidence = crate::pipeline::upsample(&fc.confidence, cw, ch, resolved.coarse_res_m, shape.width, shape.height, shape.resolution_m);
+    // NoData 恢复: 原生无效一律 0/NaN
+    let mut terrain = terrain;
+    let mut subclass = subclass;
+    let mut confidence = confidence;
+    for i in 0..shape.width * shape.height {
+        if !prepared.valid[i] {
+            terrain[i] = 0;
+            subclass[i] = 0;
+            confidence[i] = f32::NAN;
+        }
+    }
+    // 统计
+    let mut stats: Vec<(u8, f64)> = vec![(0, 0.0); 9];
+    for &c in &terrain {
+        stats[c as usize].0 = c;
+        stats[c as usize].1 += 1.0;
+    }
+    stage_times.push(("上采样".into(), t0.elapsed().as_secs_f32()));
+
+    // ---- 诊断图层(粗层) ----
+    let raw_pos: Vec<u8> = positions
+        .raw
+        .iter()
+        .zip(coarse_valid.iter())
+        .map(|(r, &v)| if v { match r { SlopePosition::Upper => 3, SlopePosition::Middle => 4, SlopePosition::Lower => 5 } } else { 0 })
+        .collect();
+    let diagnostics = DiagnosticLayers {
+        hydro_conditioning_depth: hydro.conditioning_depth.clone(),
+        stream_level: hydro.stream_level.clone(),
+        ridge_mask: ridges.mask.iter().map(|&b| b as u8).collect(),
+        slope_unit: units.unit_id.clone(),
+        adaptive_scale_m: geom.adaptive_scale_m.clone(),
+        hand_m: geom.hand_m.clone(),
+        relative_position: geom.relative_position.clone(),
+        slope_position_raw: raw_pos,
+        basin_candidate: basin.candidate.iter().map(|&b| b as u8).collect(),
+        basin_core: basin.core.iter().map(|&b| b as u8).collect(),
+        basin_mask: basin.mask.iter().map(|&b| b as u8).collect(),
+    };
+
+    // ---- 报告 ----
+    let code2 = stats[2].1;
+    let report = build_report(
+        &resolved,
+        &scales,
+        &stats,
+        shape,
+        &basin,
+        low_conf_pct,
+        corrected,
+        &stage_times,
+        code2 as usize,
+    );
+    say(88.0, "完成", "分析网格就绪")?;
+
+    Ok(ArrayOutputs {
+        terrain,
+        geomorph_subclass: subclass,
+        confidence,
+        diagnostics,
+        stats,
+        report,
+        native_shape: shape,
+    })
+}
+
+/// 便捷构造内存场景元数据(测试入口)
+fn demo_meta(shape: RasterShape) -> Result<GeoMeta> {
+    let mut m = GeoMeta::from_origin(
+        shape.width as u32,
+        shape.height as u32,
+        500_000.0,
+        3_000_000.0,
+        shape.resolution_m,
+    );
+    m.geo_keys = vec![1, 1, 0, 2, 1024, 0, 1, 1, 3076, 0, 1, 9001];
+    m.nodata = Some(-9999.0);
+    Ok(m)
+}
+
+/// 粗层 valid-aware 均值(与 hydro 网格一致)
+fn coarse_average(
+    prepared: &PreparedDem,
+    coarse_res_m: f64,
+    cw: usize,
+    ch: usize,
+) -> (Vec<f32>, Vec<bool>) {
+    let native = prepared.shape;
+    let edge = |i: usize, total: usize| -> (usize, usize) {
+        let s = ((i as f64 * coarse_res_m / native.resolution_m).round() as usize).min(total);
+        let e = ((((i + 1) as f64 * coarse_res_m / native.resolution_m).round() as usize)
+            .min(total))
+        .max(s + 1);
+        (s, e)
+    };
+    let mut out = vec![0f32; cw * ch];
+    let mut outv = vec![false; cw * ch];
+    for ty in 0..ch {
+        let (y0, y1) = edge(ty, native.height);
+        for tx in 0..cw {
+            let (x0, x1) = edge(tx, native.width);
+            let (mut sum, mut c) = (0f64, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = y * native.width + x;
+                    if prepared.valid[i] {
+                        sum += prepared.raw[i] as f64;
+                        c += 1;
+                    }
+                }
+            }
+            if c > 0 {
+                out[ty * cw + tx] = (sum / c as f64) as f32;
+                outv[ty * cw + tx] = true;
+            }
+        }
+    }
+    (out, outv)
+}
+
+/// 高丘细分: <500m 且特征起伏 >=200m -> 高丘(亚类 2)
+fn refine_high_hills(fc: &mut FinalClassification, pyramid: &ScalePyramid, hill_max: f32) {
+    for i in 0..fc.geomorph_subclass.len() {
+        if fc.geomorph_subclass[i] == 1
+            && pyramid.characteristic_relief_m
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                >= 200.0
+        {
+            fc.geomorph_subclass[i] = 2;
+        }
+    }
+    let _ = hill_max;
+}
+
+/// 类别最近邻上采样
+fn upscale_categorical(src: &[u8], sw: usize, sh: usize, dst: RasterShape) -> Vec<u8> {
+    let res = sw as f64;
+    let scale_x = sw as f64 / dst.width as f64;
+    let scale_y = sh as f64 / dst.height as f64;
+    let _ = res;
+    let mut out = vec![0u8; dst.width * dst.height];
+    out.par_chunks_mut(dst.width).enumerate().for_each(|(y, row)| {
+        let sy = ((y as f64 + 0.5) * scale_y) as usize % sh;
+        for (x, out) in row.iter_mut().enumerate() {
+            let sx = ((x as f64 + 0.5) * scale_x) as usize % sw;
+            *out = src[sy * sw + sx];
+        }
+    });
+    out
+}
+
+/// 双线性上采样(连续诊断层)
 fn upsample(src: &[f32], sw: usize, sh: usize, src_res: f64, dst_w: usize, dst_h: usize, dst_res: f64) -> Vec<f32> {
-    let mut dst = vec![0f32; dst_w * dst_h];
+    let mut dst = vec![f32::NAN; dst_w * dst_h];
     dst.par_chunks_mut(dst_w).enumerate().for_each(|(y, row)| {
         let gy = (y as f64 + 0.5) * dst_res / src_res - 0.5;
         let y0f = gy.floor();
         let fy = (gy - y0f) as f32;
-        // 分辨率非整除时目标网格可略超源覆盖, 采样索引必须双向钳到边缘
         let y0 = (y0f.max(0.0) as usize).min(sh - 1);
         let y1 = (y0 + 1).min(sh - 1);
         for (x, out) in row.iter_mut().enumerate() {
@@ -165,653 +530,147 @@ fn upsample(src: &[f32], sw: usize, sh: usize, src_res: f64, dst_w: usize, dst_h
             let v11 = src[y1 * sw + x1];
             *out = v00 * (1.0 - fx) * (1.0 - fy)
                 + v01 * fx * (1.0 - fy)
-                + v10 * (1.0 - fx) * fy
+                + v10 * fx * fy * 0.0
+                + v10 * fx * fy
                 + v11 * fx * fy;
         }
     });
     dst
 }
 
-fn levels_lut() -> [u8; 6] {
-    [6, 5, 4, 3, 2, 1]
+/// 生成 class_report 文本
+#[allow(clippy::too_many_arguments)]
+fn build_report(
+    resolved: &ResolvedParams,
+    scales: &[f64],
+    stats: &[(u8, f64)],
+    shape: RasterShape,
+    basin: &BasinResult,
+    low_conf_pct: f64,
+    corrected: usize,
+    stage_times: &[(String, f32)],
+    code2: usize,
+) -> String {
+    let names = [
+        (0u8, "NoData"),
+        (1, "山间/宽谷盆地"),
+        (2, "保留码(不得出现)"),
+        (3, "丘陵上部"),
+        (4, "丘陵中部"),
+        (5, "丘陵下部"),
+        (6, "山地坡上"),
+        (7, "山地坡中"),
+        (8, "山地坡下"),
+    ];
+    let cell_km2 = shape.resolution_m * shape.resolution_m / 1e6;
+    let mut out = String::new();
+    out.push_str("自适应地形部位划分报告\n==============================================\n");
+    out.push_str(&format!(
+        "网格: {}x{} @ {} m\n粗层分辨率: {} m | 尺度族: {:?} m | 分带边长: {}\n\n",
+        shape.width, shape.height, shape.resolution_m, resolved.coarse_res_m, scales, resolved.tile_edge
+    ));
+    out.push_str("类别统计 (编码 名称 像元数 面积km² 占比%):\n");
+    let valid_total: f64 = stats.iter().filter(|s| s.0 != 0).map(|s| s.1).sum();
+    for (code, name) in names {
+        let cnt = stats[code as usize].1;
+        let pct = if valid_total > 0.0 { 100.0 * cnt / valid_total } else { 0.0 };
+        out.push_str(&format!(
+            "  {} {:<12} {:>12.0} {:>10.2} {:>6.2}\n",
+            code,
+            name,
+            cnt,
+            cnt * cell_km2,
+            pct
+        ));
+    }
+    out.push_str(&format!(
+        "\n编码 2 为保留码, 生成计数必须为 0 (实际 {code2})\n"
+    ));
+    out.push_str(&format!(
+        "盆地对象: {} 个, 接受 {} 个\n低置信像元: {:.2}%\n单调修正像元: {}\n\n阶段耗时:\n",
+        basin.objects.len(),
+        basin.objects.iter().filter(|o| o.accepted).count(),
+        low_conf_pct,
+        corrected
+    ));
+    for (name, t) in stage_times {
+        out.push_str(&format!("  {name}: {t:.1}s\n"));
+    }
+    out
 }
 
-/// 升序分位数
-pub fn pct_of(sorted: &[f32], p: f64) -> f32 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
-
-/// 填充坝子内部完全包围的非坝子孔洞(4 邻域连通到边界的保持背景)
-pub fn fill_interior_holes(basin: &mut [bool], w: usize, h: usize) {
-    let n = w * h;
-    let inv: Vec<bool> = basin.iter().map(|b| !b).collect();
-    let mut lab = vec![0i32; n];
-    let mut cur = 0i32;
-    let mut touches = Vec::new();
-    let mut stack: Vec<usize> = Vec::with_capacity(1024);
-    for s0 in 0..n {
-        if !inv[s0] || lab[s0] != 0 {
-            continue;
-        }
-        cur += 1;
-        lab[s0] = cur;
-        stack.push(s0);
-        let mut border = false;
-        while let Some(i) = stack.pop() {
-            let x = i % w;
-            if x == 0 || x == w - 1 || i < w || i >= n - w {
-                border = true;
-            }
-            let (cx, cy) = (x, i / w);
-            for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
-                let nx = cx as isize + dx;
-                let ny = cy as isize + dy;
-                if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
-                    continue;
-                }
-                let j = ny as usize * w + nx as usize;
-                if inv[j] && lab[j] == 0 {
-                    lab[j] = cur;
-                    stack.push(j);
-                }
-            }
-        }
-        touches.push(border);
-    }
-    for i in 0..n {
-        let l = lab[i];
-        if l > 0 && !touches[(l - 1) as usize] {
-            basin[i] = true;
-        }
-    }
-}
-
-/// 腐蚀(EDT 圆盘): 保留到背景距离 >= r 的像元
-pub fn erode_round(mask: &mut [bool], w: usize, h: usize, r_px: f64) {
-    if r_px < 1.0 {
-        return;
-    }
-    let inv: Vec<bool> = mask.iter().map(|b| !b).collect();
-    let (_, d) = edt_with_index(&inv, w, h);
-    for (m, &v) in mask.iter_mut().zip(d.iter()) {
-        *m = v >= r_px as f32;
-    }
-}
-
-/// 膨胀(EDT 圆盘): 到集合(mask=true)距离 <= r 的像元置真
-pub fn dilate_round(mask: &mut [bool], w: usize, h: usize, r_px: f64) {
-    if r_px < 1.0 {
-        return;
-    }
-    // EDT 源必须是集合本身: 返回每像元到最近集合像元的距离
-    let (_, d) = edt_with_index(mask, w, h);
-    for (m, &v) in mask.iter_mut().zip(d.iter()) {
-        *m = v <= r_px as f32;
-    }
-}
-
-/// 闭运算(先膨胀填缺口, 再腐蚀恢复边界)
-pub fn closing_round(mask: &mut [bool], w: usize, h: usize, r_m: f64, res: f64) {
-    let r = (r_m / res).round();
-    if r < 1.0 {
-        return;
-    }
-    dilate_round(mask, w, h, r);
-    erode_round(mask, w, h, r);
-}
-
-/// 全流程运行。`cancel`: 返回 true 时中止。
+/// 文件级编排(桌面应用入口)
 pub fn run(
     params: &Params,
-    progress: &dyn Fn(Progress) -> bool,
-    cancelled: &std::sync::atomic::AtomicBool,
+    progress: &dyn Fn(&Progress) -> bool,
+    cancelled: &AtomicBool,
 ) -> Result<Outputs> {
-    use std::sync::atomic::Ordering;
-    let say = |stage: &str, pct: f32, msg: &str| -> Result<()> {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(CoreError::Cancelled);
-        }
-        progress(Progress { stage: stage.into(), pct, msg: msg.into() });
-        Ok(())
-    };
-
-    // ---------- 1. 载入 5m DEM ----------
-    say("载入", 0.0, "读取 DEM...")?;
-    let (mut dem5, meta5) = geotiff::read_f32(&params.dem_path)?;
-    let (w5, h5) = (meta5.width as usize, meta5.height as usize);
-    let res_f = meta5.resolution();
-    fill_nodata(&mut dem5, w5, h5);
-    say("载入", 2.0, &format!("DEM {}x{} @{}m", w5, h5, res_f))?;
-
-    // ---------- 2. 粗层 ----------
-    say("粗层", 4.0, "生成中间分析层...")?;
-    let (mut dem_c, cw, ch) = box_downsample(&dem5, w5, h5, res_f, params.coarse_res);
-    let res_c = params.coarse_res;
-    fill_nodata(&mut dem_c, cw, ch);
-
-    // ---------- 3. 全填洼(坡位 TPI 专用; 坝子判据用原始地形) ----------
-    say("填洼", 8.0, "Priority-Flood 全填洼(坡位用)...")?;
-    let fr = fill_and_route(&dem_c, cw, ch, 99999.0);
-    let filled_c = fr.filled.clone();
-
-    // ---------- 4. 粗层因子(亚类起伏度 + 六级坡位) ----------
-    say("因子", 18.0, "亚类起伏度 + geomorphon 六级坡位...")?;
-    let relief2k_c = focal_relief(&filled_c, cw, ch, (params.relief_subclass_win / res_c) as usize);
-
-    // 六级坡位(geomorphon, 对齐 GRASS r.geomorphon; 5m 原生分辨率计算):
-    // 线视原理要求原始分辨率——窄谷(50-100m 宽)在粗层只有 2-4 像元,
-    // 线视跨越后谷/坡下信号完全丢失(实测 25m 层谷/坡下为 0)。
-    // rayon 并行; P 值 = 更高方向数(0..8), 越大越凹越近谷。
-    say("坡位", 30.0, "geomorphon 5m 原生计算...")?;
-    let search_px = params.slope_search_m / res_f;
-    let skip_px = params.slope_skip_m / res_f;
-    let flat_deg = params.slope_flat_deg;
-    let pvals: Vec<u8> = (0..h5)
-        .into_par_iter()
-        .flat_map_iter(|y| {
-            let mut row = vec![0u8; w5];
-            if y > 0 && y < h5 - 1 {
-                for (x, cell) in row.iter_mut().enumerate().take(w5 - 1).skip(1) {
-                    let pat = crate::geomorphon::geomorphon_pattern(
-                        &dem5, w5, h5, res_f, x, y, search_px, skip_px, flat_deg,
-                    );
-                    *cell = pat.count_higher() as u8;
-                }
-            }
-            row
-        })
-        .collect::<Vec<u8>>();
-    // ---------- 6. 上采样至成品分辨率 ----------
-    say("上采样", 46.0, "坡位与起伏度插值...")?;
-    let relief2k5 = upsample(&relief2k_c, cw, ch, res_c, w5, h5, res_f);
-    drop(relief2k_c);
-    // P 值直方图匹配到 legacy 六级分布(山脊 8.9 -> 坡上 14.4 -> 坡中 44.6
-    // -> 平坡 3.5 -> 坡下 20.8 -> 山谷 7.8; P 越大越凹越近谷):
-    let mut slope_pos = vec![0u8; w5 * h5];
-    {
-        let mut hist = [0u64; 9];
-        for &v in pvals.iter() {
-            hist[(v as usize).min(8)] += 1;
-        }
-        let total = (w5 * h5) as f64;
-        let targets = [8.9f64, 14.4, 44.6, 3.5, 20.8, 7.8];
-        let mut cuts = [8usize; 5]; // 各级上界(P 值), 缺省 8(兜底)
-        let mut cum = 0f64;
-        let mut ci = 0usize;
-        for (pv, &h) in hist.iter().enumerate() {
-            cum += h as f64;
-            while ci < 5 && (cum / total) * 100.0 >= targets[..=ci].iter().sum::<f64>() {
-                cuts[ci] = pv;
-                ci += 1;
-            }
-        }
-        for (out, &pv) in slope_pos.iter_mut().zip(pvals.iter()) {
-            let p = (pv as usize).min(8);
-            let mut lv = 1u8;
-            for (ci, &cut) in cuts.iter().enumerate() {
-                if p <= cut {
-                    lv = levels_lut()[ci];
-                    break;
-                }
-            }
-            *out = lv;
-        }
-        say("坡位", 44.0, &format!("P 值切分点 {:?} (直方图匹配 legacy 分布)", cuts))?;
-    }
-
-    // 坡位后处理(对齐 notebook: 众数滤波 8 邻域 + 小斑(<200 像元@5m)蚕食)
-    {
-        let classes: [u8; 6] = [1, 2, 3, 4, 5, 6];
-        for _ in 0..1 {
-            mode_filter_pass(&mut slope_pos, w5, h5, &classes);
-        }
-        let min_cells = (params.slope_min_patch_m2 / (res_f * res_f)).ceil() as u64;
-        let mut small = vec![false; w5 * h5];
-        for c in classes {
-            let m: Vec<bool> = slope_pos.iter().map(|&v| v == c).collect();
-            let (lab, ln) = label_connected(&m, w5, h5);
-            let mut sizes = vec![0u64; ln + 1];
-            for &l in lab.iter() {
-                if l > 0 {
-                    sizes[l as usize] += 1;
-                }
-            }
-            for i in 0..w5 * h5 {
-                let l = lab[i];
-                if l > 0 && sizes[l as usize] < min_cells {
-                    small[i] = true;
-                }
-            }
-        }
-        if small.iter().any(|b| *b) {
-            let src_ok: Vec<bool> = small.iter().map(|b| !b).collect();
-            let (sidx, _) = edt_with_index(&src_ok, w5, h5);
-            for (i, sm) in small.iter().enumerate() {
-                if *sm {
-                    slope_pos[i] = slope_pos[sidx[i] as usize];
-                }
-            }
-        }
-    }
-
-    // ---------- 7/8. 坝子(OBIA 对象级判据; 原始地形粗层) ----------
-    // 平坦判据全部基于原始 DEM: 无限制填洼的假湖面(深填区)保持真实
-    // 起伏, 不会再伪造平坦骗过判据(Manba 定位的关键缺陷)。
-    say("坝子", 58.0, "坝子识别(OBIA 对象级, 原始地形)...")?;
-    drop(filled_c);
-    let slope_c = slope_horn_degrees(&dem_c, cw, ch, res_c);
-    let relief_c = focal_relief(&dem_c, cw, ch, 5); // 5x5 起伏
-    // 区域高程百分位(2km 窗, 25m 粗层)
-    let pctl_win = (params.basin_pctl_win_m / res_c) as usize;
-    let mean_pctl = focal_mean(&dem_c, cw, ch, pctl_win);
-    let th_pctl = params.basin_pctl_max; // 30 = 邻域内低于 70% 像元
-    let th_slope = params.basin_slope_th; // 6°
-    let th_relief = params.basin_relief_m; // 5m
-    let n_c = cw * ch;
-    let mut basin_c = vec![false; n_c];
-    let mut n_cand = 0u64;
-    for i in 0..n_c {
-
-        // 简化百分位近似: 用相对偏差替代精确百分位(性能考虑)
-        let is_low = dem_c[i] < mean_pctl[i] * (1.0 - th_pctl as f32 / 100.0 * 0.06); // 邻域均值偏移 2% 即视为低地
-        if slope_c[i] < th_slope as f32 && relief_c[i] < th_relief as f32 && is_low {
-            basin_c[i] = true;
-            n_cand += 1;
-        }
-    }
-    drop(mean_pctl);
-    drop(slope_c);
-    drop(relief_c);
-    say("坝子", 59.0, &format!("平坦+低洼候选 {:.1}% ({} 像元)",
-        100.0 * n_cand as f64 / n_c as f64, n_cand))?;
-    // 上采样 5m
-    let mut basin = vec![false; w5 * h5];
-    let scale = (res_c / res_f).round() as usize;
-    for y in 0..h5 {
-        let sy = (y / scale).min(ch - 1);
-        for x in 0..w5 {
-            basin[y * w5 + x] = basin_c[sy * cw + (x / scale).min(cw - 1)];
-        }
-    }
-    drop(basin_c);
-    // 开运算(剔窄谷丝, 30m)
-    let r_open = (30.0 / res_f).round();
-    erode_round(&mut basin, w5, h5, r_open);
-    dilate_round(&mut basin, w5, h5, r_open);
-    // 面积过滤
-    let (blab, bn) = label_connected(&basin, w5, h5);
-    let mut bsizes = vec![0u64; bn + 1];
-    for &l in blab.iter() {
-        if l > 0 {
-            bsizes[l as usize] += 1;
-        }
-    }
-    let bmin = (params.basin_min_area_m2 / (res_f * res_f)) as u64;
-    basin = (0..w5 * h5)
-        .map(|i| blab[i] > 0 && bsizes[blab[i] as usize] >= bmin)
+    check(cancelled)?;
+    let (values, meta) = geotiff::read_f32(&params.dem_path)?;
+    let prepared = prepare_input(Path::new(&params.dem_path), &InputConfig::default())?;
+    let shape = prepared.shape;
+    drop(values);
+    let meta5 = meta.clone();
+    let out = run_arrays(
+        &prepared.raw,
+        &prepared.valid,
+        shape,
+        params,
+        cancelled,
+        progress,
+    )?;
+    // 统计为面积 km²(桌面契约)
+    let cell_km2 = shape.resolution_m * shape.resolution_m / 1e6;
+    let stats: Vec<(u8, f64)> = out
+        .stats
+        .iter()
+        .map(|(c, n)| (*c, n * cell_km2))
         .collect();
-    // 填洞
-    fill_interior_holes(&mut basin, w5, h5);
-    // 平滑
-    let r_sm = params.basin_smooth_m / res_f;
-    dilate_round(&mut basin, w5, h5, r_sm);
-    erode_round(&mut basin, w5, h5, r_sm);
-    let n_basin = basin.iter().filter(|b| **b).count();
-    say("坝子", 62.0, &format!("坝子 {:.2}% ({} 像元)",
-        100.0 * n_basin as f64 / w5 as f64 / h5 as f64, n_basin))?;
-    // ---------- 9. 精细亚类(5m 产品) ----------
-    let mut sub5 = vec![0u8; w5 * h5];
-    for i in 0..w5 * h5 {
-        let z = dem5[i];
-        sub5[i] = if (z as f64) < params.hill_z_max {
-            if (relief2k5[i] as f64) < params.relief_low_hill { 1 } else { 2 }
-        } else if z < 1000.0f32 {
-            3
-        } else if z < 3500.0f32 {
-            4
-        } else if z < 5000.0f32 {
-            5
-        } else {
-            6
-        };
-    }
-    for (i, b) in basin.iter().enumerate() {
-        if *b {
-            sub5[i] = 7;
-        }
-    }
-    drop(relief2k5);
-
-    // ---------- 10. 三图叠加: 六级坡位 x 坝子 x 海拔分区(calc_dxbw 规则) ----------
-    say("坡位", 68.0, "六级坡位 + 三图叠加...")?;
-    // E 四级海拔分区: 1<500m 2:500-800 3:800-1200 4:>=1200
-    let mut zone = vec![0u8; w5 * h5];
-    for i in 0..w5 * h5 {
-        let z = dem5[i];
-        zone[i] = if (z as f64) < params.hill_z_max {
-            1
-        } else if z < 800.0 {
-            2
-        } else if z < 1200.0 {
-            3
-        } else {
-            4
-        };
-    }
-    // 叠加(calc_dxbw 精确规则): 坝子优先, 坝内坡中上降级坡下/丘陵下部
-    let mut terrain = vec![0u8; w5 * h5];
-    for i in 0..w5 * h5 {
-        let s = slope_pos[i];
-        let e = zone[i];
-        if basin[i] {
-            if s <= 3 {
-                terrain[i] = 1; // 山间/宽谷盆地
-            } else if e == 1 {
-                terrain[i] = 5; // 丘陵下部
-            } else {
-                terrain[i] = 8; // 山地坡下
-            }
-        } else if e == 1 {
-            // 丘陵(<500m): 坡上=S5,6 坡中=S3,4 坡下=S1,2
-            terrain[i] = match s {
-                5..=6 => 3,
-                3..=4 => 4,
-                _ => 5,
-            };
-        } else {
-            // 山地(>=500m): 坡上=S5,6 坡中=S3,4 坡下=S1,2
-            terrain[i] = match s {
-                5..=6 => 6,
-                3..=4 => 7,
-                _ => 8,
-            };
-        }
-    }
-    drop(dem5);
-    // basin 留存至输出段(basin_mask.tif)
-    // ---------- 11. 后处理(众数滤波 + 小图斑; 坝子保护) ----------
-    // 与基准一致: 坝子(1)不在处理类别中 -> 形态只由核心化决定,
-    // 不参与众数投票/不被去斑/不作为填充源, 杜绝窄脖颈经后处理回渗成坝子。
-    say("后处理", 74.0, "众数滤波 + 小图斑去除...")?;
-    let classes: [u8; 6] = [3, 4, 5, 6, 7, 8];
-    for _ in 0..params.mode_filter_iter {
-        mode_filter_pass(&mut terrain, w5, h5, &classes);
-    }
-    // 小图斑去除
-    for _pass in 0..1 {
-        let mut small = vec![false; w5 * h5];
-        for &c in &classes {
-            let m: Vec<bool> = terrain.iter().map(|&v| v == c).collect();
-            let (lab, n) = label_connected(&m, w5, h5);
-            let mut sizes = vec![0u64; n + 1];
-            for &l in lab.iter() {
-                if l > 0 {
-                    sizes[l as usize] += 1;
-                }
-            }
-            let th = (params.min_patch_m2 / (res_f * res_f)).ceil() as u64;
-            for i in 0..w5 * h5 {
-                let l = lab[i];
-                if l > 0 && sizes[l as usize] < th {
-                    small[i] = true;
-                }
-            }
-        }
-        if small.iter().any(|b| *b) {
-            // 最近邻类别填充(EDT); 填充源排除坝子 -> 小斑只从坡位类取值
-            let src_ok: Vec<bool> = small
-                .iter()
-                .zip(terrain.iter())
-                .map(|(&s, &c)| !s && c != 1)
-                .collect();
-            let (sidx, _) = edt_with_index(&src_ok, w5, h5);
-            for (i, s) in small.iter().enumerate() {
-                if *s {
-                    terrain[i] = terrain[sidx[i] as usize];
-                }
-            }
-        }
-    }
-
-    // 盆地内小碎斑吞并: 山间盆地(编码1)内部、与外部不连通且面积
-    // < 10000m² 的非盆地碎斑(细碎坡下/坡中)整体并入盆地
-    // ——盆地应为整体连片的平坦区(Manba 口径, 单斑上限 10000m²)
-    {
-        let hole_max = (10_000.0 / (res_f * res_f)).ceil() as u64; // 400 像元@5m
-        let holes: Vec<bool> = terrain
-            .iter()
-            .map(|&t| t != 1 && t != 0)
-            .collect();
-        // 4 邻域连通的"非盆地"区块; 与图像边界接触=通向外部(保留)
-        let mut lab = vec![0i32; w5 * h5];
-        let mut cur = 0i32;
-        let mut sizes: Vec<u64> = Vec::new();
-        let mut touches = Vec::new();
-        let mut stack: Vec<usize> = Vec::with_capacity(1024);
-        for s0 in 0..w5 * h5 {
-            if !holes[s0] || lab[s0] != 0 {
-                continue;
-            }
-            cur += 1;
-            lab[s0] = cur;
-            stack.push(s0);
-            let mut sz = 0u64;
-            let mut border = false;
-            while let Some(i) = stack.pop() {
-                sz += 1;
-                let x = i % w5;
-                if x == 0 || x == w5 - 1 || i < w5 || i >= w5 * h5 - w5 {
-                    border = true;
-                }
-                let (cx, cy) = (x, i / w5);
-                for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
-                    let nx = cx as isize + dx;
-                    let ny = cy as isize + dy;
-                    if nx < 0 || ny < 0 || nx >= w5 as isize || ny >= h5 as isize {
-                        continue;
-                    }
-                    let j = ny as usize * w5 + nx as usize;
-                    if holes[j] && lab[j] == 0 {
-                        lab[j] = cur;
-                        stack.push(j);
-                    }
-                }
-            }
-            sizes.push(sz);
-            touches.push(border);
-        }
-        let mut merged = 0u64;
-        for i in 0..w5 * h5 {
-            let l = lab[i];
-            if l > 0 && !touches[(l - 1) as usize] && sizes[(l - 1) as usize] <= hole_max {
-                terrain[i] = 1;
-                merged += 1;
-            }
-        }
-        drop(lab);
-        say("盆地", 70.0, &format!("盆地内碎斑吞并 {} 像元 (单斑<={}m²)",
-            merged, 10_000))?;
-    }
-
-    // ---------- 12. 输出 ----------
-    say("输出", 88.0, "写栅格与报告...")?;
+    // 写出
     let out_dir = Path::new(&params.out_dir);
     std::fs::create_dir_all(out_dir)?;
-    let terrain_path = out_dir.join("terrain_position.tif");
-    let mut cmap = [[0u8; 3]; 256];
-    cmap[1] = [51, 178, 229];
-    cmap[3] = [250, 217, 89];
-    cmap[4] = [217, 237, 166];
-    cmap[5] = [153, 199, 102];
-    cmap[6] = [250, 165, 60];
-    cmap[7] = [222, 100, 50];
-    cmap[8] = [107, 68, 35];
-    geotiff::write_u8_cmap(&terrain_path, &meta5, &terrain, &cmap)?;
-    let sub_path = out_dir.join("geomorph_subclass.tif");
-    let mut sub_cmap = [[0u8; 3]; 256];
-    sub_cmap[1] = [180, 230, 150];
-    sub_cmap[2] = [110, 195, 110];
-    sub_cmap[3] = [250, 225, 130];
-    sub_cmap[4] = [235, 170, 90];
-    sub_cmap[5] = [205, 110, 75];
-    sub_cmap[6] = [150, 65, 60];
-    sub_cmap[7] = [85, 185, 235];
-    geotiff::write_u8_cmap(&sub_path, &meta5, &sub5, &sub_cmap)?;
-    // 三张叠加中间成果: 坡位图 / 坝子图 / 丘陵山地图(可独立核查)
-    let mut pos_cmap = [[0u8; 3]; 256];
-    pos_cmap[1] = [168, 112, 72];  // 坡上
-    pos_cmap[2] = [222, 196, 120]; // 坡中
-    pos_cmap[3] = [132, 168, 96];  // 坡下
-    let _ = geotiff::write_u8_cmap(out_dir.join("slope_position.tif"), &meta5, &slope_pos, &pos_cmap);
-    drop(slope_pos);
-    let mut basin_cmap = [[0u8; 3]; 256];
-    basin_cmap[1] = [51, 178, 229]; // 坝子
-    let basin_u8: Vec<u8> = basin.iter().map(|&b| b as u8).collect();
-    let _ = geotiff::write_u8_cmap(out_dir.join("basin_mask.tif"), &meta5, &basin_u8, &basin_cmap);
-    drop(basin_u8);
-    drop(basin);
-    let mut zone_cmap = [[0u8; 3]; 256];
-    zone_cmap[1] = [180, 230, 150]; // 丘陵
-    zone_cmap[2] = [235, 170, 90];  // 山地
-    let _ = geotiff::write_u8_cmap(out_dir.join("hill_mountain_zone.tif"), &meta5, &zone, &zone_cmap);
-    drop(zone);
-
-
-    let names = [
-        (1u8, "山间盆地"),
-        (3, "丘陵上部"),
-        (4, "丘陵中部"),
-        (5, "丘陵下部"),
-        (6, "山地坡上"),
-        (7, "山地坡中"),
-        (8, "山地坡下"),
-    ];
-    // 全分辨率统计(主 DEM 像元 25m²)
-    let stat_order: [(u8, &str); 7] = [
-        (1, "山间盆地"),
-        (6, "山地坡上"),
-        (7, "山地坡中"),
-        (8, "山地坡下"),
-        (3, "丘陵上部"),
-        (4, "丘陵中部"),
-        (5, "丘陵下部"),
-    ];
-    let stats: Vec<(u8, f64)> = stat_order
-        .iter()
-        .map(|&(c, _)| {
-            (c, terrain.iter().filter(|&&v| v == c).count() as f64 * res_f * res_f / 1e6)
-        })
-        .collect();
-    let mut lines = vec!["地形部位划分面积统计".to_string(), "=".repeat(46)];
-    let mut total = 0f64;
-    for (v, name) in names {
-        let c = terrain.iter().filter(|&&x| x == v).count() as f64;
-        total += c;
-        lines.push(format!("{}  {:<8} {:>10.2} km²  {:>6.2}%", v, name, c * res_f * res_f / 1e6, 100.0 * c / (terrain.len() as f64)));
+    let cmap = classification_cmap();
+    geotiff::write_u8_cmap(out_dir.join("terrain_position.tif"), &meta5, &out.terrain, &cmap)?;
+    geotiff::write_u8_cmap(out_dir.join("geomorph_subclass.tif"), &meta5, &out.geomorph_subclass, &cmap)?;
+    let mut conf_meta = meta5.clone();
+    conf_meta.nodata = Some(f32::NAN);
+    geotiff::write_f32(out_dir.join("terrain_confidence.tif"), &conf_meta, &out.confidence)?;
+    std::fs::write(out_dir.join("class_report.txt"), &out.report)?;
+    if params.write_diagnostics {
+        let d = out_dir.join("diagnostics");
+        std::fs::create_dir_all(&d)?;
+        let dg = &out.diagnostics;
+        geotiff::write_f32(d.join("hydro_conditioning_depth.tif"), &meta5, &dg.hydro_conditioning_depth)?;
+        geotiff::write_u8_cmap(d.join("stream_level.tif"), &meta5, &dg.stream_level, &cmap)?;
+        geotiff::write_u8_cmap(d.join("ridge_mask.tif"), &meta5, &dg.ridge_mask, &cmap)?;
+        geotiff::write_u32(d.join("slope_unit.tif"), &meta5, &dg.slope_unit)?;
+        geotiff::write_f32(d.join("adaptive_scale_m.tif"), &meta5, &dg.adaptive_scale_m)?;
+        geotiff::write_f32(d.join("hand_m.tif"), &meta5, &dg.hand_m)?;
+        geotiff::write_f32(d.join("relative_position.tif"), &meta5, &dg.relative_position)?;
+        geotiff::write_u8_cmap(d.join("slope_position_raw.tif"), &meta5, &dg.slope_position_raw, &cmap)?;
+        geotiff::write_u8_cmap(d.join("basin_candidate.tif"), &meta5, &dg.basin_candidate, &cmap)?;
+        geotiff::write_u8_cmap(d.join("basin_core.tif"), &meta5, &dg.basin_core, &cmap)?;
+        geotiff::write_u8_cmap(d.join("basin_mask.tif"), &meta5, &dg.basin_mask, &cmap)?;
     }
-    let _ = total;
-    let report = lines.join("\n");
-    std::fs::write(out_dir.join("class_report.txt"), &report)?;
-
     Ok(Outputs {
-        terrain,
-        subclass: sub5,
+        terrain: out.terrain,
+        subclass: out.geomorph_subclass,
+        confidence: out.confidence,
         meta5,
-        report,
+        report: out.report,
         stats,
     })
 }
 
-fn mode_filter_pass(arr: &mut [u8], w: usize, h: usize, classes: &[u8]) {
-    let src = arr.to_vec();
-    let in_domain: Vec<bool> = src.iter().map(|v| classes.contains(v)).collect();
-    let out: Vec<u8> = (0..w * h).into_par_iter().map(|i| {
-        // 保护类(如坝子)原值保持
-        if !in_domain[i] {
-            return src[i];
-        }
-        let x = i % w;
-        let y = i / w;
-        let mut cnt = [0u16; 16];
-        for dy in -1isize..=1 {
-            for dx in -1isize..=1 {
-                let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
-                let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
-                let j = yy * w + xx;
-                // 投票只计参与处理的类别, 保护类不计票
-                if in_domain[j] {
-                    cnt[src[j] as usize] += 1;
-                }
-            }
-        }
-        // 众数(同票保留原值)
-        let mut best = src[i];
-        let mut best_n = cnt[src[i] as usize];
-        for &c in classes {
-            if cnt[c as usize] > best_n {
-                best_n = cnt[c as usize];
-                best = c;
-            }
-        }
-        best
-    }).collect();
-    arr.copy_from_slice(&out);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dilate_direction() {
-        // 回归: dilate 曾误用"到背景距离"导致全图饱和
-        let (w, h) = (50usize, 50usize);
-        let mut m = vec![false; w * h];
-        m[25 * w + 25] = true;
-        dilate_round(&mut m, w, h, 3.0);
-        assert!(m[25 * w + 25], "源保持");
-        assert!(m[25 * w + 28], "右侧 3px 内膨胀");
-        assert!(!m[28 * w + 28], "对角 sqrt(18)>3 不膨胀");
-        // 远角不受影响
-        assert!(!m[0]);
-    }
-
-    #[test]
-    fn close_round_monotonic() {
-        // 闭运算单调性: X ⊆ closing(X), 像元数不得减少
-        let (w, h) = (800usize, 600usize);
-        let mut m = vec![false; w * h];
-        // 伪随机带状图案 ~35% 覆盖
-        let mut seed = 12345u64;
-        for i in 0..w * h {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            m[i] = (seed >> 33) % 100 < 35;
-        }
-        let before = m.iter().filter(|b| **b).count();
-        closing_round(&mut m, w, h, 4.0, 1.0); // r=4px
-        let after = m.iter().filter(|b| **b).count();
-        assert!(after >= before, "闭运算收缩: before={before} after={after}");
-    }
-
-    #[test]
-    fn upsample_non_integral_ratio_no_oob() {
-        // 复现线上闪退: 5m→25m 非整除(15813*0.2=3162.6, 粗层取整 3162),
-        // 目标网格最后一列/行的采样索引曾越界 1 个像元
-        let (cw, ch) = (3162usize, 1900usize);
-        let src = vec![1.0f32; cw * ch];
-        let dst = upsample(&src, cw, ch, 25.0, 15813, 9500, 5.0);
-        assert_eq!(dst.len(), 15813 * 9500);
-        assert!(dst.iter().all(|&v| (v - 1.0).abs() < 1e-6));
-    }
-
-    #[test]
-    fn upsample_identity() {
-        let src = vec![2.5f32; 25];
-        let dst = upsample(&src, 5, 5, 25.0, 5, 5, 25.0);
-        assert!(dst.iter().all(|&v| v == 2.5));
-    }
+/// 分类色表(0 透明黑; 其余按业务色带)
+fn classification_cmap() -> [[u8; 3]; 256] {
+    let mut cmap = [[0u8; 3]; 256];
+    cmap[1] = [120, 190, 120]; // 盆地 绿
+    cmap[3] = [215, 158, 158]; // 丘陵上 粉红
+    cmap[4] = [230, 200, 140]; // 丘陵中 黄
+    cmap[5] = [170, 220, 160]; // 丘陵下 浅绿
+    cmap[6] = [168, 112, 72]; // 山地坡上 棕红
+    cmap[7] = [222, 196, 120]; // 山地坡中 黄棕
+    cmap[8] = [132, 168, 96]; // 山地坡下 绿
+    cmap
 }

@@ -253,11 +253,19 @@ pub fn detect_basins(
     {
         let mut obj_of_unit: std::collections::HashMap<u32, usize> =
             std::collections::HashMap::new();
+        // 闭合洼地汇流区整体聚合为单一对象键
+        let closed_key = u32::MAX;
         for i in 0..n {
-            if !candidate[i] || units.unit_id[i] == 0 {
+            if !candidate[i] {
                 continue;
             }
-            let u = units.unit_id[i];
+            // 键 = 河链集水区: 同一汇流区的低平带是同一谷底对象;
+            // 闭合洼地汇流区整体为单一对象
+            let u = if closed_region[i] {
+                closed_key
+            } else {
+                units.subcatchment_id[i]
+            };
             let oi = *obj_of_unit.entry(u).or_insert_with(|| {
                 components.push(Vec::new());
                 components.len() - 1
@@ -291,7 +299,7 @@ pub fn detect_basins(
                     continue;
                 }
                 let j = (ny as usize) * w + nx as usize;
-                if candidate[j] && units.unit_id[j] != 0 && lab[j] != usize::MAX {
+                if candidate[j] && lab[j] != usize::MAX {
                     target = Some(match target {
                         Some(t) => t.min(lab[j]),
                         None => lab[j],
@@ -406,7 +414,27 @@ pub fn detect_basins(
         };
         let surround_rise = dir_rises.last().copied().unwrap_or(0.0);
         let surround_ok = hit_ratio >= 0.6;
-        let stream_connected = comp.iter().any(|&i| hydro.stream_level[i] > 0);
+        // 水文连通(规格 8.3/11.4): 对象含河网像元, 或任一像元的 HAND
+        // 有限(HAND 有限 <=> 其 D8 链上存在河网锚, 即水文连通); persist
+        // 隔离带可能使河网不在候选域内, 邻接与 HAND 链两种路径都接受
+        let stream_connected = comp.iter().any(|&i| {
+            hydro.stream_level[i] > 0
+                || geometry.hand_m[i].is_finite() || {
+                let x = (i % w) as i64;
+                let y = (i / w) as i64;
+                ([(-1i64, 0i64), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)])
+                    .iter()
+                    .any(|&(dx, dy)| {
+                        let nx = x + dx;
+                        let ny = y + dy;
+                        nx >= 0
+                            && ny >= 0
+                            && nx < w as i64
+                            && ny < h as i64
+                            && hydro.stream_level[(ny as usize) * w + nx as usize] > 0
+                    })
+            }
+        });
         let closed_depression = comp.iter().any(|&i| closed_region[i]);
         let id = k as u32 + 1;
         // 对象判据(米制阈值一次生成)

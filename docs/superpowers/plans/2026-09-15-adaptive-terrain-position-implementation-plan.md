@@ -946,7 +946,7 @@ git commit -m "feat: compose and clean terrain positions within slope units"
 - Delete or migrate obsolete calls in: `rust/topo_core/examples/*.rs`
 - Modify: `rust/topo_core/tests/classification.rs`
 
-- [ ] **Step 1: Add a failing array-level end-to-end test**
+- [x] **Step 1: Add a failing array-level end-to-end test**
 
 Complete the Task 1 test by specifying this API:
 
@@ -967,13 +967,13 @@ pub fn run_arrays_for_test(
 
 Assert `nested_ridges` produces all three slope positions and no class dominates more than 90% of valid cells.
 
-- [ ] **Step 2: Run and confirm the old pipeline fails the contract**
+- [x] **Step 2: Run and confirm the old pipeline fails the contract**
 
 Run: `cd rust; cargo test --release --test classification final_codes_obey_contract`
 
 Expected: compile failure or distribution assertion failure before the rewrite.
 
-- [ ] **Step 3: Reduce `pipeline.rs` to orchestration**
+- [x] **Step 3: Reduce `pipeline.rs` to orchestration**
 
 Keep public `run(params, progress, cancelled) -> Result<Outputs>`. Its stage order is fixed:
 
@@ -992,7 +992,7 @@ Keep public `run(params, progress, cancelled) -> Result<Outputs>`. Its stage ord
 
 At every stage invoke cancellation checks before allocating another global buffer. Drop stage-local vectors once their last consumer finishes.
 
-- [ ] **Step 4: Define diagnostic output exactly**
+- [x] **Step 4: Define diagnostic output exactly**
 
 ```rust
 pub struct DiagnosticLayers {
@@ -1012,7 +1012,7 @@ pub struct DiagnosticLayers {
 
 Extend `geotiff.rs` with `write_u32` for `slope_unit.tif`. When `write_diagnostics=false`, retain diagnostics only until formal output creation and skip the directory entirely.
 
-- [ ] **Step 5: Write filenames and report schema**
+- [x] **Step 5: Write filenames and report schema**
 
 Always write:
 
@@ -1023,11 +1023,11 @@ Always write:
 
 When enabled, write the eleven fields above under `diagnostics/` with matching snake-case filenames. `class_report.txt` contains input metadata, resolved parameter values, usable scales, class pixel count/area/percentage, basin object table, invalid count, low-confidence percentage, monotonic correction count, elapsed time per stage, and warnings. It explicitly states “code 2 reserved; emitted count must be 0”.
 
-- [ ] **Step 6: Remove legacy production behavior**
+- [x] **Step 6: Remove legacy production behavior**
 
 Delete `SeedMode`, fixed `slope_search_m` production use, global histogram-matching code, Euclidean nearest-river logic, elevation-versus-focal-mean basin percentile, and unused basin bridge/merge fields. Migrate diagnostic examples to the new module APIs or delete an example when it exists only to compare retired schemes. This is a direct replacement; do not preserve a hidden old-mode flag.
 
-- [ ] **Step 7: Run end-to-end tests and sample smoke**
+- [x] **Step 7: Run end-to-end tests and sample smoke**
 
 Run:
 
@@ -1039,7 +1039,7 @@ cargo run -p topo_core --example run_sample --release
 
 Expected: all invariant tests pass; sample run has code 2 count zero, upper/middle/lower all present, and no non-basin class above 90% of valid area.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```powershell
 git add rust/topo_core/src/pipeline.rs rust/topo_core/src/geotiff.rs rust/topo_core/examples rust/topo_core/tests/classification.rs

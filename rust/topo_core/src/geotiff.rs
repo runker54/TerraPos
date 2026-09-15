@@ -317,3 +317,19 @@ mod tests {
         assert!(back.iter().zip(data.iter()).all(|(a, b)| a == b));
     }
 }
+
+/// 写 GeoTIFF: uint32 栅格(坡面单元编号等)
+pub fn write_u32<P: AsRef<Path>>(
+    path: P,
+    meta: &GeoMeta,
+    data: &[u32],
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut enc = tiff::encoder::TiffEncoder::new(BufWriter::new(file))?;
+    {
+        let mut img = enc.new_image::<colortype::Gray32>(meta.width, meta.height)?;
+        write_geo_tags(&mut img.encoder(), meta)?;
+        img.write_data(data)?;
+    }
+    Ok(())
+}

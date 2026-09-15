@@ -20,6 +20,8 @@ pub struct SlopeUnits {
     pub valley_mask: Vec<bool>,
     /// 脊屏障
     pub ridge_mask: Vec<bool>,
+    /// 河链集水区标识(透传自脊线模型, 供谷底对象聚合)
+    pub subcatchment_id: Vec<u32>,
     pub shape: RasterShape,
 }
 
@@ -105,6 +107,14 @@ pub fn build_slope_units(
                 {
                     continue;
                 }
+                // 子流域约束: 不同子流域(分水两侧)不得进入同一单元,
+                // 脊线掩膜的局部缺口不再导致跨脊单元
+                if ridges.subcatchment_id[i] != 0
+                    && ridges.subcatchment_id[j] != 0
+                    && ridges.subcatchment_id[i] != ridges.subcatchment_id[j]
+                {
+                    continue;
+                }
                 if compat(aspect_sector[i], aspect_sector[j]) {
                     unit_id[j] = cur;
                     stack.push(j);
@@ -160,6 +170,7 @@ pub fn build_slope_units(
         aspect_sector,
         valley_mask,
         ridge_mask,
+        subcatchment_id: ridges.subcatchment_id.clone(),
         shape: hydro.shape,
     })
 }
@@ -226,6 +237,12 @@ fn constrained_dijkstra(
         if hydro::ordered(dist[i]) > dbits {
             continue; // lazy deletion
         }
+        // 屏障像元(脊/谷, unit 0)只作锚定终点, 不得作为中转,
+        // 否则约束距离会跨脊/跨谷把对侧单元连起来
+        let i_is_barrier = units.unit_id[i] == 0;
+        if i_is_barrier && !seeds[i] {
+            continue;
+        }
         let x = (i % w) as i64;
         let y = (i / w) as i64;
         for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
@@ -238,15 +255,11 @@ fn constrained_dijkstra(
             if !valid[j] {
                 continue;
             }
-            // 不同单元禁止入队(屏障: 脊/谷/无效均为 unit 0)
-            if units.unit_id[i] != 0
+            // 跨单元禁止: 两侧均为单元像元且不同(屏障由"不入队"阻断)
+            if !i_is_barrier
                 && units.unit_id[j] != 0
                 && units.unit_id[i] != units.unit_id[j]
             {
-                continue;
-            }
-            if units.unit_id[j] == 0 && units.unit_id[i] != 0 {
-                // 单元像元不得穿入屏障/无效区(种子自身除外, 由 dist=0 边界豁免)
                 continue;
             }
             let step = res * if dx != 0 && dy != 0 { std::f64::consts::SQRT_2 } else { 1.0 };
@@ -264,7 +277,9 @@ fn constrained_dijkstra(
             if nd < dist[j] {
                 dist[j] = nd;
                 anchor[j] = anchor[i];
-                heap.push(Reverse((hydro::ordered(nd), j as u32)));
+                if units.unit_id[j] != 0 {
+                    heap.push(Reverse((hydro::ordered(nd), j as u32)));
+                }
             }
         }
     }
