@@ -269,3 +269,76 @@ pub fn slope_horn_degrees(dem: &[f32], w: usize, h: usize, res: f64) -> Vec<f32>
     }
     slope
 }
+
+// ---------------- valid-aware 曲率(Zevenbergen & Thorne 3x3 二次拟合) ----------------
+
+/// 由 3x3 邻域二次有限差分计算剖面曲率(沿最大坡降方向)。
+/// 边缘或任一邻域无效时输出 Float32 NoData(NaN), 不复制造辑值。
+pub fn profile_curvature(dem: &[f32], w: usize, h: usize, res: f64) -> Vec<f32> {
+    curvature_generic(dem, w, h, res, true)
+}
+
+/// 由 3x3 邻域二次有限差分计算平面曲率(沿等高线方向)。
+pub fn plan_curvature(dem: &[f32], w: usize, h: usize, res: f64) -> Vec<f32> {
+    curvature_generic(dem, w, h, res, false)
+}
+
+fn curvature_generic(dem: &[f32], w: usize, h: usize, res: f64, profile: bool) -> Vec<f32> {
+    let n = w * h;
+    let mut out = vec![f32::NAN; n];
+    let l2 = res * res;
+    let g_at = |x: usize, y: usize| -> Option<f64> {
+        let v = dem[y * w + x];
+        if v.is_finite() {
+            Some(v as f64)
+        } else {
+            None
+        }
+    };
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            let zw = g_at(x - 1, y);
+            let ze = g_at(x + 1, y);
+            let zn = g_at(x, y - 1);
+            let zs = g_at(x, y + 1);
+            let zc = g_at(x, y);
+            let znw = g_at(x - 1, y - 1);
+            let zne = g_at(x + 1, y - 1);
+            let zsw = g_at(x - 1, y + 1);
+            let zse = g_at(x + 1, y + 1);
+            let (
+                Some(zw),
+                Some(ze),
+                Some(zn),
+                Some(zs),
+                Some(zc),
+                Some(znw),
+                Some(zne),
+                Some(zsw),
+                Some(zse),
+            ) = (zw, ze, zn, zs, zc, znw, zne, zsw, zse)
+            else {
+                continue;
+            };
+            // Zevenbergen & Thorne 二阶导
+            let dgr = (ze - zw) / (2.0 * res); // dz/dx
+            let egr = (zs - zn) / (2.0 * res); // dz/dy
+            let dd = (ze - 2.0 * zc + zw) / l2; // d2z/dx2
+            let ee = (zs - 2.0 * zc + zn) / l2; // d2z/dy2
+            let ff = (zne - zse - znw + zsw) / (4.0 * l2); // d2z/dxdy
+            let denom = dgr * dgr + egr * egr;
+            if denom <= 1e-12 {
+                continue; // 平地: 曲率无定义, 保留 NaN
+            }
+            // 符号约定与 ArcGIS 一致: 凸坡为负, 凹坡为正
+            let v = if profile {
+                2.0 * (dd * dgr * dgr + ee * egr * egr + ff * dgr * egr) / denom
+            } else {
+                2.0 * (dd * egr * egr + ee * dgr * dgr - ff * dgr * egr) / denom
+            };
+            out[i] = v as f32;
+        }
+    }
+    out
+}

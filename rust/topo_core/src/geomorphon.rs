@@ -69,8 +69,17 @@ pub fn geomorphon_pattern(
         (0.0, -1.0),
         (1.0, -1.0),
     ];
-    let search_px = search_m / res;
-    let skip_px = skip_m / res;
+    let search_px = (search_m / res).ceil();
+    let skip_px = (skip_m / res).ceil();
+    debug_assert!(search_m > skip_m, "search_m 必须 > skip_m");
+    debug_assert!(
+        skip_m == 0.0 || skip_m >= res,
+        "skip_m 应 >= 分辨率或为 0(禁用)"
+    );
+    debug_assert!(
+        skip_px >= 1.0 || skip_m == 0.0,
+        "skip 像元换算不得低于 1 像元"
+    );
     let flat_rad = flat_deg.to_radians();
     let mut pat = Pattern8::default();
     let at = |fx: f64, fy: f64| -> f32 {
@@ -147,6 +156,141 @@ pub fn pattern_to_level(pat: &Pattern8, _min_extreme: u32) -> u8 {
         5..=6 => 3,
         7 => 2,
         _ => 1,
+    }
+}
+
+// ---------------- 标准十形态(计划 Task 5, 替代计数映射) ----------------
+
+/// GRASS r.geomorphon 十种标准地貌形态
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landform {
+    Flat = 1,
+    Peak = 2,
+    Ridge = 3,
+    Shoulder = 4,
+    Spur = 5,
+    Slope = 6,
+    Hollow = 7,
+    Footslope = 8,
+    Valley = 9,
+    Pit = 10,
+}
+
+impl Landform {
+    /// 上/中/下坡位基础证据(设计规格 10.2 表; Flat 由 q 与 HAND 下游再细分)
+    pub fn evidence(self) -> (f32, f32, f32) {
+        match self {
+            Landform::Peak => (1.00, 0.00, 0.00),
+            Landform::Ridge => (0.90, 0.10, 0.00),
+            Landform::Shoulder => (0.70, 0.30, 0.00),
+            Landform::Spur => (0.55, 0.45, 0.00),
+            Landform::Slope => (0.10, 0.80, 0.10),
+            Landform::Hollow => (0.00, 0.45, 0.55),
+            Landform::Footslope => (0.00, 0.25, 0.75),
+            Landform::Valley => (0.00, 0.10, 0.90),
+            Landform::Pit => (0.00, 0.00, 1.00),
+            Landform::Flat => (0.05, 0.25, 0.70),
+        }
+    }
+}
+
+/// 环形同色弧段数(跳过 flat 方向; 环形闭合, 全同色为 1)
+fn circular_runs(s: &[u8; 8]) -> usize {
+    let mut runs = 0usize;
+    for k in 0..8 {
+        let cur = s[k];
+        let prev = s[(k + 7) % 8];
+        if cur != 0 && prev != cur {
+            runs += 1;
+        }
+    }
+    runs.max(1)
+}
+
+/// 某一色的环形弧宽合计(方向数)
+fn arc_width(s: &[u8; 8], color: u8) -> usize {
+    s.iter().filter(|&&v| v == color).count()
+}
+
+/// 规范化三值码: trits {lower=0, flat=1, higher=2}, 取 8 旋转与 8 镜像的
+/// 最小三进制编码, 用于诊断与不变性测试(判定树与其等价)。
+pub fn canonical_code(pat: &Pattern8) -> u32 {
+    // 内部编码(0=flat,1=higher,2=lower) -> 计划契约 trits(lower=0,flat=1,higher=2)
+    let to_trit = |v: u8| match v {
+        2 => 0u32, // lower
+        0 => 1u32, // flat
+        _ => 2u32, // higher
+    };
+    let tri: Vec<u32> = pat.0.iter().map(|&v| to_trit(v)).collect();
+    let reflect: Vec<u32> = tri.iter().rev().copied().collect();
+    let mut best = u32::MAX;
+    for base in [&tri, &reflect] {
+        for r in 0..8 {
+            let mut code = 0u32;
+            for k in 0..8 {
+                code = code * 3 + base[(r + k) % 8];
+            }
+            best = best.min(code);
+        }
+    }
+    best
+}
+
+/// 标准十形态判定(环形弧段拓扑, 旋转与镜像不变):
+/// - 无差异 Flat; 全低 Peak; 全高 Pit
+/// - 1 段: 纯高段+平坦 -> Footslope; 纯低段+平坦 -> Shoulder
+/// - 2 段: 含平坦 -> Shoulder; 无平坦 -> Slope
+/// - 4 段(两低两高相对): 低弧宽 >= 高弧宽 -> Ridge, 否则 Valley
+/// - 6 段以上(破碎): 低多 -> Spur, 高多 -> Hollow, 均衡 -> Slope
+///
+/// 等宽 4 段在旋转+镜像规范化下本征简并, 按约定归 Ridge(与 GRASS 一致)。
+pub fn pattern_to_landform(pat: &Pattern8) -> Landform {
+    let s = &pat.0;
+    let l = arc_width(s, 2); // lower 方向数
+    let h = arc_width(s, 1); // higher 方向数
+    if l == 0 && h == 0 {
+        return Landform::Flat;
+    }
+    if l == 8 {
+        return Landform::Peak;
+    }
+    if h == 8 {
+        return Landform::Pit;
+    }
+    let runs = circular_runs(s);
+    match runs {
+        1 => {
+            if h > 0 {
+                Landform::Footslope
+            } else {
+                Landform::Shoulder
+            }
+        }
+        2 => {
+            if l + h < 8 {
+                Landform::Shoulder
+            } else {
+                Landform::Slope
+            }
+        }
+        4 => {
+            // 山脊: 沿脊两方向低(窄低弧), 横向两壁抬升(宽高弧); 山谷相反
+            if l <= h {
+                Landform::Ridge
+            } else {
+                Landform::Valley
+            }
+        }
+        _ => {
+            if l > h {
+                Landform::Spur
+            } else if h > l {
+                Landform::Hollow
+            } else {
+                Landform::Slope
+            }
+        }
     }
 }
 

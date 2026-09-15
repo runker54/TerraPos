@@ -439,7 +439,7 @@ git commit -m "feat: select terrain scale from robust multiscale relief"
 - Modify: `rust/topo_core/src/terrain.rs`
 - Create: `rust/topo_core/tests/geomorphon_forms.rs`
 
-- [ ] **Step 1: Write failing form-table and distance tests**
+- [x] **Step 1: Write failing form-table and distance tests**
 
 Construct representative `Pattern8` values for flat, peak, ridge, shoulder, spur, slope, hollow, footslope, valley, and pit. Assert each maps to its own form. Add a regression where a 1000 m search at 5 m resolution reaches 200 cells, not 40 cells.
 
@@ -452,25 +452,25 @@ pub enum Landform {
 }
 ```
 
-- [ ] **Step 2: Run and confirm the legacy mapping fails**
+- [x] **Step 2: Run and confirm the legacy mapping fails**
 
 Run: `cd rust; cargo test --release --test geomorphon_forms`
 
 Expected: missing `Landform` or multiple forms collapsing into the same old level.
 
-- [ ] **Step 3: Implement canonical rotational lookup**
+- [x] **Step 3: Implement canonical rotational lookup**
 
 Encode each pattern as trits `{lower=0, flat=1, higher=2}`. Generate its eight rotations and eight reflected rotations, choose the minimum canonical code, and map the canonical code to the standard ten-form decision table. Keep `Pattern8` public for diagnostics. Remove `pattern_to_level` and `geomorphon_levels` after all callers move in Task 12.
 
-- [ ] **Step 4: Correct the unit boundary**
+- [x] **Step 4: Correct the unit boundary**
 
 `geomorphon_pattern` continues to accept `search_m` and `skip_m`. It alone calculates `ceil(distance_m / resolution_m)`. All callers pass metre values unchanged. Add debug assertions that `skip_m >= resolution_m`, `search_m > skip_m`, and generated sample offsets do not exceed `ceil(search_m/resolution_m)`.
 
-- [ ] **Step 5: Add terrain derivatives**
+- [x] **Step 5: Add terrain derivatives**
 
 Expose valid-aware `profile_curvature` and `plan_curvature` in `terrain.rs` using 3×3 quadratic finite differences. The edge and invalid-neighbour policy is Float32 NoData, not replicated values.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 Run: `cd rust; cargo test --release --test geomorphon_forms; cargo test --release terrain::`
 
