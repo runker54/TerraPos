@@ -3,7 +3,27 @@
 //! 所有高程函数一律使用像元中心米坐标: `x=(col+0.5)*res`, `y=(row+0.5)*res`,
 //! 保证同一场景在不同分辨率下解析一致, 供尺度稳定性测试复用。
 
+use topo_core::geotiff::GeoMeta;
 use topo_core::input::RasterShape;
+
+/// 构造带 GeoKey 目录的内存 GeoMeta(模型类型 + 线性单位可指定),
+/// 供输入契约测试表达投影米制/地理度/投影英尺等元数据组合。
+pub fn meta_with_keys(
+    width: u32,
+    height: u32,
+    res: f64,
+    model_type: u16,
+    linear_units: u16,
+) -> GeoMeta {
+    let mut m = GeoMeta::from_origin(width, height, 500_000.0, 3_000_000.0, res);
+    // GeoKey 目录: 头 4 SHORT(版本1, 修订1.0, 键数2) + 每键 4 SHORT(内联值)
+    m.geo_keys = vec![
+        1, 1, 0, 2, //
+        1024, 0, 1, model_type, //
+        3076, 0, 1, linear_units,
+    ];
+    m
+}
 
 /// 平面斜坡: 自南向北线性上升(坡降 0.08), 南缘谷底、北缘山脊。
 pub fn planar_slope(width: usize, height: usize, res: f64) -> (Vec<f32>, RasterShape) {

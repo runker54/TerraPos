@@ -205,7 +205,7 @@ git commit -m "test: define adaptive terrain classification invariants"
 - Modify: `rust/topo_core/src/lib.rs`
 - Modify: `rust/topo_core/src/error.rs`
 
-- [ ] **Step 1: Write failing GeoTIFF metadata tests**
+- [x] **Step 1: Write failing GeoTIFF metadata tests**
 
 Add tests for: Float32 projected-metre raster accepted; geographic EPSG:4490 rejected; projected feet rejected; non-square or non-positive pixels rejected; GDAL NoData tag parsed; boundary-connected NoData preserved; a finite interior hole up to `10_000 m²` filled; a larger interior hole preserved invalid.
 
@@ -218,13 +218,13 @@ fn rejects_geographic_crs_even_when_pixel_size_is_small() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify failure**
+- [x] **Step 2: Run the tests and verify failure**
 
 Run: `cd rust; cargo test --release --test input_contract`
 
 Expected: unresolved imports for `input::validate_meta` and missing `GeoMeta::nodata`.
 
-- [ ] **Step 3: Extend `GeoMeta` and GeoTIFF parsing**
+- [x] **Step 3: Extend `GeoMeta` and GeoTIFF parsing**
 
 Add `pub nodata: Option<f32>` to `GeoMeta`. Parse TIFF tag 42113 as trimmed ASCII Float32. Add GeoKey lookup helpers for `GTModelTypeGeoKey=1024` and `ProjLinearUnitsGeoKey=3076`; accept model type 1 with unit EPSG 9001 only. Preserve raw keys when writing and write tag 42113 for Float32 diagnostics and categorical outputs.
 
@@ -247,7 +247,7 @@ impl GeoMeta {
 
 The implementation of `geo_key_u16` must honor the GeoKeyDirectory header count and only return inline values where `TIFFTagLocation == 0`; unsupported indirection yields `None` and therefore an explicit validation error.
 
-- [ ] **Step 4: Implement input preparation**
+- [x] **Step 4: Implement input preparation**
 
 Expose:
 
@@ -264,17 +264,17 @@ pub fn prepare_input(path: &Path, cfg: &InputConfig) -> Result<PreparedDem>;
 
 Build `valid` from finite values not equal to metadata NoData. Flood-fill invalid cells from all raster edges to mark external NoData. Connected internal invalid objects are filled by nearest valid cell only when `cell_count * resolution_m² <= max_interior_hole_area_m2`; larger objects stay invalid. Produce `geomorph` by one valid-aware circular mean filter with the requested metre radius. Never mutate `raw` outside accepted small interior holes.
 
-- [ ] **Step 5: Add actionable errors and export the module**
+- [x] **Step 5: Add actionable errors and export the module**
 
 Use `CoreError::Invalid` messages containing the observed pixel size, model type, and unit key. Add `pub mod input;` to `lib.rs` and correct the stale module list in its crate docs.
 
-- [ ] **Step 6: Run tests**
+- [x] **Step 6: Run tests**
 
 Run: `cd rust; cargo test --release --test input_contract`
 
 Expected: all input contract tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add rust/topo_core/src/input.rs rust/topo_core/src/geotiff.rs rust/topo_core/src/lib.rs rust/topo_core/src/error.rs rust/topo_core/tests/input_contract.rs

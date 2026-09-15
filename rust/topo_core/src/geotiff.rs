@@ -17,7 +17,14 @@ pub struct GeoMeta {
     pub tiepoint: [f64; 6],
     pub geo_keys: Vec<u16>,
     pub geo_ascii: Option<String>,
+    /// GDAL NoData 哨兵值 (tag 42113)
+    pub nodata: Option<f32>,
 }
+
+/// GeoKey 标准 ID: GTModelTypeGeoKey(1=投影, 2=地理)
+const KEY_MODEL_TYPE: u16 = 1024;
+/// GeoKey 标准 ID: ProjLinearUnitsGeoKey(9001=米)
+const KEY_LINEAR_UNITS: u16 = 3076;
 
 impl GeoMeta {
     /// 由仿射参数构造（左上角 x/y + 分辨率）
@@ -29,6 +36,7 @@ impl GeoMeta {
             tiepoint: [0.0, 0.0, 0.0, x0, y0, 0.0],
             geo_keys: Vec::new(),
             geo_ascii: None,
+            nodata: None,
         }
     }
     pub fn origin(&self) -> (f64, f64) {
@@ -36,6 +44,21 @@ impl GeoMeta {
     }
     pub fn resolution(&self) -> f64 {
         self.pixel_scale[0]
+    }
+    /// 查找 GeoKey 目录中 TIFFTagLocation=0、Count=1 的内联 SHORT 值。
+    /// 间接寻址(外部数据)不支持, 返回 None -> 上层显式报错。
+    pub fn geo_key_u16(&self, key_id: u16) -> Option<u16> {
+        let entry_count = *self.geo_keys.get(3)? as usize;
+        (0..entry_count).find_map(|i| {
+            let base = 4 + i * 4;
+            let entry = self.geo_keys.get(base..base + 4)?;
+            (entry[0] == key_id && entry[1] == 0 && entry[2] == 1).then_some(entry[3])
+        })
+    }
+    /// 是否为投影坐标系且线性单位为米
+    pub fn is_projected_metre(&self) -> bool {
+        self.geo_key_u16(KEY_MODEL_TYPE) == Some(1)
+            && self.geo_key_u16(KEY_LINEAR_UNITS) == Some(9001)
     }
 }
 
@@ -158,6 +181,14 @@ pub fn read_f32<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, GeoMeta)> {
         meta.geo_ascii =
             Some(String::from_utf8_lossy(&e.data).trim_end_matches('\0').to_string());
     }
+    // GDAL NoData 哨兵 (tag 42113, ASCII)
+    if let Some(e) = tags.get(&42113) {
+        let s = String::from_utf8_lossy(&e.data);
+        let t = s.trim_matches('\0').trim();
+        if !t.is_empty() {
+            meta.nodata = t.parse::<f32>().ok();
+        }
+    }
 
     let file = File::open(path)?;
     let mut dec = tiff::decoder::Decoder::new(BufReader::new(file))?
@@ -172,7 +203,29 @@ pub fn read_f32<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, GeoMeta)> {
 // 像素编码交由 tiff crate(zlib 压缩), GeoTags 通过 DirectoryEncoder::write_tag 注入
 
 use tiff::encoder::colortype;
+use tiff::encoder::DirectoryEncoder;
+use tiff::encoder::TiffKind;
 use tiff::tags::Tag;
+
+/// 写出地理标签组(仿射 + GeoKey + ASCII + GDAL NoData)
+fn write_geo_tags<W: std::io::Write + std::io::Seek, K: TiffKind>(
+    dir: &mut DirectoryEncoder<W, K>,
+    meta: &GeoMeta,
+) -> Result<()> {
+    dir.write_tag(Tag::Unknown(33550), &meta.pixel_scale[..])?;
+    dir.write_tag(Tag::Unknown(33922), &meta.tiepoint[..])?;
+    if !meta.geo_keys.is_empty() {
+        dir.write_tag(Tag::Unknown(34735), &meta.geo_keys[..])?;
+    }
+    if let Some(a) = &meta.geo_ascii {
+        dir.write_tag(Tag::Unknown(34737), a.as_str())?;
+    }
+    if let Some(nd) = meta.nodata {
+        // tiff crate 对 str 自动追加 NUL 终止符(ASCII 类型)
+        dir.write_tag(Tag::Unknown(42113), format!("{nd}").as_str())?;
+    }
+    Ok(())
+}
 
 /// 写 GeoTIFF: float32 高程栅格
 pub fn write_f32<P: AsRef<Path>>(
@@ -184,15 +237,7 @@ pub fn write_f32<P: AsRef<Path>>(
     let mut enc = tiff::encoder::TiffEncoder::new(BufWriter::new(file))?;
     {
         let mut img = enc.new_image::<colortype::Gray32Float>(meta.width, meta.height)?;
-        let dir = img.encoder();
-        dir.write_tag(Tag::Unknown(33550), &meta.pixel_scale[..])?;
-        dir.write_tag(Tag::Unknown(33922), &meta.tiepoint[..])?;
-        if !meta.geo_keys.is_empty() {
-            dir.write_tag(Tag::Unknown(34735), &meta.geo_keys[..])?;
-        }
-        if let Some(a) = &meta.geo_ascii {
-            dir.write_tag(Tag::Unknown(34737), a.as_str())?;
-        }
+        write_geo_tags(img.encoder(), meta)?;
         img.write_data(data)?;
     }
     Ok(())
@@ -209,7 +254,6 @@ pub fn write_u8_cmap<P: AsRef<Path>>(
     let mut enc = tiff::encoder::TiffEncoder::new(BufWriter::new(file))?;
     {
         let mut img = enc.new_image::<colortype::Gray8>(meta.width, meta.height)?;
-        let dir = img.encoder();
         // 色表: tag 320, SHORT[768], 通道优先 R,G,B, 值域 0..65535
         let mut cm: Vec<u16> = Vec::with_capacity(768);
         for ch in 0..3 {
@@ -217,15 +261,9 @@ pub fn write_u8_cmap<P: AsRef<Path>>(
                 cm.push((px[ch] as u16) * 257);
             }
         }
+        let dir = img.encoder();
         dir.write_tag(Tag::Unknown(320), &cm[..])?;
-        dir.write_tag(Tag::Unknown(33550), &meta.pixel_scale[..])?;
-        dir.write_tag(Tag::Unknown(33922), &meta.tiepoint[..])?;
-        if !meta.geo_keys.is_empty() {
-            dir.write_tag(Tag::Unknown(34735), &meta.geo_keys[..])?;
-        }
-        if let Some(a) = &meta.geo_ascii {
-            dir.write_tag(Tag::Unknown(34737), a.as_str())?;
-        }
+        write_geo_tags(img.encoder(), meta)?;
         img.write_data(data)?;
     }
     Ok(())
