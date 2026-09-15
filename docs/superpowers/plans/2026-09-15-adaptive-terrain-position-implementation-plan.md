@@ -371,21 +371,21 @@ git commit -m "feat: derive nested streams and flow-connected hand"
 - Modify: `rust/topo_core/src/filter.rs`
 - Modify: `rust/topo_core/src/lib.rs`
 
-- [ ] **Step 1: Write failing characteristic-scale tests**
+- [x] **Step 1: Write failing characteristic-scale tests**
 
 Use geometrically identical Gaussian hills sampled at 5 m, 10 m, and 25 m. Assert median selected `R0` over the central landform differs by at most one adjacent scale step. Add a narrow hill and broad mountain test and assert the broad feature selects a larger median scale. Add a constant vertical offset and assert identical selected scales.
 
-- [ ] **Step 2: Run and confirm failure**
+- [x] **Step 2: Run and confirm failure**
 
 Run: `cd rust; cargo test --release --test adaptive_scale`
 
 Expected: missing `scale` module.
 
-- [ ] **Step 3: Add valid-aware robust filters**
+- [x] **Step 3: Add valid-aware robust filters**
 
 Implement `focal_quantile_valid`, `focal_median_valid`, and `focal_mad_valid`. Use an exact sorted neighbourhood only in unit tests and a separable/histogram or tiled selection implementation in production so a 4000 m radius never creates an `O(n*r²)` loop. The functions accept metre radius and convert using `RasterShape::resolution_m` internally once.
 
-- [ ] **Step 4: Add scale contracts and bounds**
+- [x] **Step 4: Add scale contracts and bounds**
 
 ```rust
 pub const BASE_SCALES_M: [f64; 6] = [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0];
@@ -410,15 +410,15 @@ pub fn build_scale_pyramid(dem: &[f32], valid: &[bool], shape: RasterShape, grow
 
 Drop scales smaller than five coarse pixels and larger than one quarter of the shorter valid-extent dimension. Require at least three usable scales; otherwise return a clear “DEM extent too small for multiscale classification” error.
 
-- [ ] **Step 5: Implement scale metrics and selection**
+- [x] **Step 5: Implement scale metrics and selection**
 
 At each scale compute `DEV=z-local_median`, `H=P95-P05`, `NDEV=DEV/(1.4826*MAD+0.1)`, and `g=(H_next-H)/max(H_next,0.1)`. Select the first scale with `g < threshold` for two consecutive transitions and `H > 5 m`; if none qualifies, select the scale minimizing `abs(g-threshold)` among layers with `H > 5 m`, else the smallest usable scale. Store only coarse-grid layers.
 
-- [ ] **Step 6: Add landform scale clamping helper**
+- [x] **Step 6: Add landform scale clamping helper**
 
 Expose `scale_bounds_for(elevation_m, relief_m, data_max_m) -> (f32, f32)` with exact approved ranges: low hill 125–750, high hill 250–1500, low mountain 250–2000, middle mountain 500–4000, high mountain 750–6000, extreme mountain 1000–min(8000,data maximum). Apply the project’s current elevation/relief subclass thresholds only here, so classification code does not duplicate them.
 
-- [ ] **Step 7: Run tests and commit**
+- [x] **Step 7: Run tests and commit**
 
 Run: `cd rust; cargo test --release --test adaptive_scale`
 

@@ -219,3 +219,150 @@ pub fn focal_std(src: &[f32], w: usize, h: usize, win: usize) -> Vec<f32> {
     }
     out
 }
+
+// ---------------- valid-aware 稳健邻域统计(米制半径) ----------------
+
+use crate::input::RasterShape;
+
+/// 生产级滑窗稳健统计: 逐尺度把窗口抽稀到约 1/4 半径的瓦片网格上做精确
+/// 排序选取, 4000 m 半径也不会产生 O(n*r^2) 循环。
+/// 返回 (median, mad, p05, p95); 无效像元输出 NaN。
+pub fn focal_robust_stats_valid(
+    dem: &[f32],
+    valid: &[bool],
+    shape: RasterShape,
+    radius_m: f64,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let n = shape.width * shape.height;
+    let r_px = ((radius_m / shape.resolution_m).round() as i64).max(1);
+    let step = (r_px / 4).max(1) as usize;
+    let (sw, sh) = (shape.width.div_ceil(step), shape.height.div_ceil(step));
+    // 瓦片网格: valid-aware 均值抽稀
+    let mut sm = vec![0f32; sw * sh];
+    let mut scnt = vec![0u32; sw * sh];
+    for ty in 0..sh {
+        for tx in 0..sw {
+            let (x0, x1) = (tx * step, ((tx + 1) * step).min(shape.width));
+            let (y0, y1) = (ty * step, ((ty + 1) * step).min(shape.height));
+            let mut sum = 0f64;
+            let mut c = 0u32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = y * shape.width + x;
+                    if valid[i] {
+                        sum += dem[i] as f64;
+                        c += 1;
+                    }
+                }
+            }
+            let i = ty * sw + tx;
+            scnt[i] = c;
+            sm[i] = if c > 0 { (sum / c as f64) as f32 } else { f32::NAN };
+        }
+    }
+    // 瓦片邻域半径(瓦片格上)
+    // 该工具链 i64::div_ceil 仍属不稳定特性, 手写向上取整
+    let sr = ((r_px + step as i64 - 1) / step as i64) as usize;
+    let mut med = vec![f32::NAN; n];
+    let mut mad = vec![f32::NAN; n];
+    let mut p05 = vec![f32::NAN; n];
+    let mut p95 = vec![f32::NAN; n];
+    let q = |sorted: &[f32], p: f64| -> f32 {
+        let idx = (((sorted.len() - 1) as f64 * p).round() as usize).min(sorted.len() - 1);
+        sorted[idx]
+    };
+    for ty in 0..sh {
+        for tx in 0..sw {
+            let ti = ty * sw + tx;
+            if scnt[ti] == 0 {
+                continue;
+            }
+            let y0 = ty.saturating_sub(sr);
+            let y1 = (ty + sr + 1).min(sh);
+            let x0 = tx.saturating_sub(sr);
+            let x1 = (tx + sr + 1).min(sw);
+            let mut vals: Vec<f32> = Vec::with_capacity((y1 - y0) * (x1 - x0));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let j = y * sw + x;
+                    if scnt[j] > 0 {
+                        vals.push(sm[j]);
+                    }
+                }
+            }
+            if vals.is_empty() {
+                continue;
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let m = q(&vals, 0.5);
+            // 写回瓦片覆盖的原网格范围
+            let (ux0, ux1) = (tx * step, ((tx + 1) * step).min(shape.width));
+            let (uy0, uy1) = (ty * step, ((ty + 1) * step).min(shape.height));
+            let abs: Vec<f32> = vals.iter().map(|&v| (v - m).abs()).collect();
+            let mut abs_sorted = abs.clone();
+            abs_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let md = q(&abs_sorted, 0.5);
+            let (lo, hi) = (q(&vals, 0.05), q(&vals, 0.95));
+            for y in uy0..uy1 {
+                for x in ux0..ux1 {
+                    let i = y * shape.width + x;
+                    if valid[i] {
+                        med[i] = m;
+                        mad[i] = md;
+                        p05[i] = lo;
+                        p95[i] = hi;
+                    }
+                }
+            }
+        }
+    }
+    (med, mad, p05, p95)
+}
+
+/// valid-aware 滑窗分位数(米制半径)
+pub fn focal_quantile_valid(
+    dem: &[f32],
+    valid: &[bool],
+    shape: RasterShape,
+    radius_m: f64,
+    p: f64,
+) -> Vec<f32> {
+    let (_, _, lo, hi) = focal_robust_stats_valid(dem, valid, shape, radius_m);
+    if p <= 0.5 {
+        lo
+    } else {
+        hi
+    }
+}
+
+/// valid-aware 滑窗中位数(米制半径)
+pub fn focal_median_valid(
+    dem: &[f32],
+    valid: &[bool],
+    shape: RasterShape,
+    radius_m: f64,
+) -> Vec<f32> {
+    focal_robust_stats_valid(dem, valid, shape, radius_m).0
+}
+
+/// valid-aware 滑窗中位绝对偏差(米制半径; med 为预计算中位数场)
+pub fn focal_mad_valid(
+    dem: &[f32],
+    valid: &[bool],
+    shape: RasterShape,
+    radius_m: f64,
+    med: &[f32],
+) -> Vec<f32> {
+    let absdev: Vec<f32> = dem
+        .iter()
+        .zip(med.iter())
+        .map(|(&z, &m)| {
+            if z.is_finite() && m.is_finite() {
+                (z - m).abs()
+            } else {
+                f32::NAN
+            }
+        })
+        .collect();
+    focal_median_valid(&absdev, valid, shape, radius_m)
+}

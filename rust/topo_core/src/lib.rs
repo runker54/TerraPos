@@ -19,5 +19,6 @@ pub mod geotiff;
 pub mod hydro;
 pub mod input;
 pub mod pipeline;
+pub mod scale;
 pub mod segment;
 pub mod terrain;
