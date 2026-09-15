@@ -11,6 +11,7 @@
 //! - [`geomorphon`]：geomorphon 地貌形态模式
 //! - [`pipeline`]：参数模型 + 全流程编排
 
+pub mod basin;
 pub mod distance;
 pub mod geomorphon;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod geotiff;
 pub mod hydro;
 pub mod input;
 pub mod pipeline;
+pub mod postprocess;
 pub mod ridge;
 pub mod scale;
 pub mod slope_position;

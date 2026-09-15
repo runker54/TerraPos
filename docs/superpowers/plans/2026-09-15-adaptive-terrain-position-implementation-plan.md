@@ -882,17 +882,17 @@ git commit -m "feat: classify and reconstruct geomorphic basin objects"
 - Modify: `rust/topo_core/src/lib.rs`
 - Modify: `rust/topo_core/tests/classification.rs`
 
-- [ ] **Step 1: Write failing composition and cleanup tests**
+- [x] **Step 1: Write failing composition and cleanup tests**
 
 Assert basin overrides slope position; hill/mountain is selected solely by the configured 500 m elevation boundary; code 2 is never emitted; invalid cells remain zero. Add a one-cell speckle adjacent to a ridge and assert cleanup cannot move it across the ridge. Add 500 deterministic ridge-to-valley traces and require at least 95% to be monotonic after correction.
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run: `cd rust; cargo test --release --test classification compose_codes`
 
 Expected: missing `postprocess` module.
 
-- [ ] **Step 3: Implement direct composition**
+- [x] **Step 3: Implement direct composition**
 
 ```rust
 pub struct FinalClassification {
@@ -915,15 +915,15 @@ pub fn constrained_cleanup(
 
 Map lower/middle/upper to codes `3/4/5` below 500 m and `6/7/8` at or above 500 m. `geomorph_subclass` stores the existing relief/elevation subclass code independently of slope-position output.
 
-- [ ] **Step 4: Merge small patches without crossing terrain barriers**
+- [x] **Step 4: Merge small patches without crossing terrain barriers**
 
 Set smoothing distance `clip(5*strength, 5, 50) m`, further capped by `0.02*median(L)` per unit. Label same-code patches inside each slope unit and hill/mountain zone. A patch below `smoothing_distance²` merges into the adjacent class with longest shared boundary, then smallest total membership loss. Never merge across ridge, valley, basin edge, NoData, or hill/mountain boundary.
 
-- [ ] **Step 5: Enforce monotonic traces with dynamic programming**
+- [x] **Step 5: Enforce monotonic traces with dynamic programming**
 
 Trace from every retained ridge seed to its paired valley anchor along decreasing `distance_to_valley_m`. Solve the three-state sequence with allowed transitions `upper→upper|middle|lower`, `middle→middle|lower`, `lower→lower`; the per-cell cost is negative log membership. Basin cells are fixed and excluded. Apply a correction only when total sequence cost improves and affected cells have confidence below 0.35. Record corrected-cell count in the report.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 Run: `cd rust; cargo test --release --test classification`
 
