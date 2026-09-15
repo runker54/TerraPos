@@ -365,3 +365,137 @@ mod tests {
         let _ = p0;
     }
 }
+// ---------------- 自适应形态证据(Task 8) ----------------
+
+use crate::error::{CoreError, Result};
+use rayon::prelude::*;
+use crate::input::RasterShape;
+use crate::terrain::{plan_curvature, profile_curvature, slope_degrees};
+
+/// 尺度索引形态证据产品
+#[derive(Debug, Clone)]
+pub struct MorphEvidence {
+    /// 所选最近尺度层的十形态
+    pub form: Vec<Landform>,
+    /// 上/中/下坡位基础证据(0..1, 三者和为 1)
+    pub upper: Vec<f32>,
+    pub middle: Vec<f32>,
+    pub lower: Vec<f32>,
+    /// 小尺度坡度(度)
+    pub slope_deg: Vec<f32>,
+    pub profile_curvature: Vec<f32>,
+    pub plan_curvature: Vec<f32>,
+    /// 尺度端点或导数支持不完整
+    pub low_confidence: Vec<bool>,
+}
+
+/// 逐可用尺度计算 geomorphon 形态层, 逐像元取其 adaptive_scale_m 最近层;
+/// 剖面/平面曲率对上/下证据做至多 0.10 的符号修正后归一化。
+/// 尺度层从小到大处理, 像元值一旦定格即释放该层缓冲。
+pub fn adaptive_morphology_evidence(
+    dem: &[f32],
+    valid: &[bool],
+    shape: RasterShape,
+    adaptive_scale_m: &[f32],
+    usable_scales_m: &[f64],
+) -> Result<MorphEvidence> {
+    if usable_scales_m.is_empty() {
+        return Err(CoreError::Invalid("尺度族为空, 无法计算形态证据".into()));
+    }
+    let w = shape.width;
+    let h = shape.height;
+    let n = w * h;
+    let res = shape.resolution_m;
+
+    // 导数场(一次)
+    let slope_deg = slope_degrees(dem, w, h, res);
+    let pc = profile_curvature(dem, w, h, res);
+    let pk = plan_curvature(dem, w, h, res);
+
+    // 每像元最近尺度层索引
+    let nearest: Vec<u8> = (0..n)
+        .map(|i| {
+            let s = adaptive_scale_m[i] as f64;
+            if !s.is_finite() || s <= 0.0 {
+                return 0u8;
+            }
+            let mut best = 0u8;
+            let mut bd = f64::INFINITY;
+            for (k, &r) in usable_scales_m.iter().enumerate() {
+                let d = (r - s).abs();
+                if d < bd {
+                    bd = d;
+                    best = k as u8;
+                }
+            }
+            best
+        })
+        .collect();
+
+    let mut form = vec![Landform::Flat; n];
+    let mut upper = vec![0f32; n];
+    let mut middle = vec![0f32; n];
+    let mut lower = vec![0f32; n];
+    let mut low_confidence = vec![true; n];
+
+    // 层从小到大处理: 像元在所属最近层定格证据后即释放层缓冲
+    for (k, &radius) in usable_scales_m.iter().enumerate() {
+        let skip_m = (2.0 * res).max(0.05 * radius);
+        let flat_deg = 3.0;
+        // 逐行并行 geomorphon
+        let forms_k: Vec<Landform> = (0..h)
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                (0..w).map(move |x| {
+                    let i = y * w + x;
+                    if !valid[i] || !dem[i].is_finite() {
+                        return Landform::Flat;
+                    }
+                    let pat = geomorphon_pattern(
+                        dem, w, h, res, x, y, radius, skip_m, flat_deg,
+                    );
+                    pattern_to_landform(&pat)
+                })
+            })
+            .collect();
+        for i in 0..n {
+            if nearest[i] != k as u8 || !valid[i] {
+                continue;
+            }
+            form[i] = forms_k[i];
+            let (mut u, m, mut l) = forms_k[i].evidence();
+            // 曲率符号修正(约定: 凸为负), 剖面/平面各至多 0.05
+            if pc[i].is_finite() {
+                let t = (pc[i] / 0.05).clamp(-1.0, 1.0);
+                u += 0.05 * (-t).max(0.0);
+                l += 0.05 * t.max(0.0);
+            }
+            if pk[i].is_finite() {
+                let t = (pk[i] / 0.05).clamp(-1.0, 1.0);
+                u += 0.05 * (-t).max(0.0);
+                l += 0.05 * t.max(0.0);
+            }
+            let sum = u + m + l;
+            if sum > 0.0 {
+                upper[i] = u / sum;
+                middle[i] = m / sum;
+                lower[i] = l / sum;
+            }
+            let endpoint = k == 0 || k == usable_scales_m.len() - 1;
+            let deriv_ok = slope_deg[i].is_finite() && pc[i].is_finite() && pk[i].is_finite();
+            low_confidence[i] = endpoint || !deriv_ok;
+        }
+        drop(forms_k);
+    }
+
+    Ok(MorphEvidence {
+        form,
+        upper,
+        middle,
+        lower,
+        slope_deg,
+        profile_curvature: pc,
+        plan_curvature: pk,
+        low_confidence,
+    })
+}

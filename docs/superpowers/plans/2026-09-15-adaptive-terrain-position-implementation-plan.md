@@ -651,17 +651,17 @@ git commit -m "feat: compute adaptive relative slope geometry"
 - Modify: `rust/topo_core/src/geomorphon.rs`
 - Modify: `rust/topo_core/tests/geomorphon_forms.rs`
 
-- [ ] **Step 1: Write failing adaptive-evidence tests**
+- [x] **Step 1: Write failing adaptive-evidence tests**
 
 For a hill-to-valley transect, assert peak/ridge/shoulder evidence favours upper position, hollow/footslope/valley favours lower position, and planar slope favours middle position. Double the feature width and assert the sampled geomorphon radius follows `adaptive_scale_m` rather than staying fixed.
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run: `cd rust; cargo test --release --test geomorphon_forms adaptive_evidence`
 
 Expected: missing `MorphEvidence` and `adaptive_morphology_evidence`.
 
-- [ ] **Step 3: Implement scale-indexed morphology layers**
+- [x] **Step 3: Implement scale-indexed morphology layers**
 
 ```rust
 pub struct MorphEvidence {
@@ -698,11 +698,11 @@ Compute one geomorphon raster per usable scale using `search_m=scale` and `skip_
 
 Refine each score by at most 0.10 from the sign and robust magnitude of profile curvature and plan curvature. Renormalize the three scores to sum to one. Mark a cell low-confidence when the selected scale is at a scale-family endpoint or derivative support is incomplete.
 
-- [ ] **Step 4: Limit memory by releasing scale layers**
+- [x] **Step 4: Limit memory by releasing scale layers**
 
 Process scale layers from small to large. Copy a cell’s form into the final buffer when that layer is its nearest selected scale, then release the layer. Keep only the final form/evidence and current working buffers.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 Run: `cd rust; cargo test --release --test geomorphon_forms`
 
