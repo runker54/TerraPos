@@ -268,3 +268,163 @@ fn slope_units_do_not_cross_barriers() {
         _ = cnt;
     }
 }
+
+// ---------------- Task 7: 约束距离/自适应尺度/相对位置 ----------------
+
+use topo_core::slope_unit::{build_slope_geometry, SlopeUnits};
+
+/// 双谷隔脊场景: 谷底 x=500m 与 x=1500m, 中央 x=1000m 为脊(+40m)
+fn dual_valley(steep: f64, mirror: bool) -> (Vec<f32>, topo_core::input::RasterShape) {
+    let (w, h, res) = (201usize, 201usize, 10.0);
+    let mut dem = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let xi = if mirror { w - 1 - x } else { x };
+            let xm = (xi as f64 + 0.5) * res;
+            let ym = (y as f64 + 0.5) * res;
+            let d_near = (xm - 500.0).abs().min((xm - 1500.0).abs());
+            dem[y * w + x] = (800.0 + steep * d_near + 0.004 * ym) as f32;
+        }
+    }
+    (dem, topo_core::input::RasterShape { width: w, height: h, resolution_m: res })
+}
+
+fn full_geometry(
+    dem: Vec<f32>,
+    w: u32,
+    h: u32,
+    res: f64,
+) -> (
+    Context,
+    topo_core::ridge::RidgeModel,
+    SlopeUnits,
+    topo_core::slope_unit::SlopeGeometry,
+) {
+    let ctx = build_context(dem, w, h, res);
+    let ridges =
+        build_ridges(&ctx.coarse, &ctx.valid, &ctx.hydro, &ctx.pyramid, &ctx.landform).unwrap();
+    let units = build_slope_units(&ctx.coarse, &ctx.valid, &ctx.hydro, &ridges).unwrap();
+    let geom = build_slope_geometry(
+        &ctx.coarse,
+        &ctx.valid,
+        &units,
+        &ctx.hydro,
+        &ctx.pyramid,
+        20.0,
+    )
+    .unwrap();
+    (ctx, ridges, units, geom)
+}
+
+/// 跨脊欧氏最近谷永不作为谷锚: 左谷坡像元的锚必在左谷(中央脊 x=1000m 左侧)
+#[test]
+fn constrained_distance_never_crosses_ridge() {
+    let (dem, _) = dual_valley(0.08, false);
+    let (ctx, _r, units, geom) = full_geometry(dem, 201, 201, 10.0);
+    let cw = ctx.shape.width;
+    for i in 0..cw * ctx.shape.height {
+        if units.valley_mask[i] {
+            assert_eq!(geom.distance_to_valley_m[i], 0.0, "谷像元 {i} dv 应为 0");
+        }
+        if units.ridge_mask[i] {
+            assert_eq!(geom.distance_to_ridge_m[i], 0.0, "脊像元 {i} dr 应为 0");
+        }
+        if geom.relative_position[i].is_finite() {
+            assert!(
+                (0.0..=1.0).contains(&geom.relative_position[i]),
+                "q 越界: {}",
+                geom.relative_position[i]
+            );
+        }
+        let l = geom.local_width_m[i];
+        if l.is_finite() {
+            let (dv, dr) = (geom.distance_to_valley_m[i], geom.distance_to_ridge_m[i]);
+            assert!(
+                (l - (dv + dr)).abs() < 0.5,
+                "L != dv+dr @ {i}"
+            );
+        }
+    }
+    // 谷锚不跨中央脊(粗列 40): x<40 的坡面像元锚 x<=22(左谷 500m/25m+2)
+    let mut checked = 0usize;
+    for y in 5..ctx.shape.height - 5 {
+        for x in 23..40usize {
+            let i = y * cw + x;
+            if units.unit_id[i] == 0 || geom.valley_anchor[i] == u32::MAX {
+                continue;
+            }
+            let ax = (geom.valley_anchor[i] as usize % cw) as f64 * 25.0;
+            assert!(
+                ax <= 550.0,
+                "左坡像元 ({x},{y}) 谷锚在 {ax}m, 跨脊关联到右谷"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 200, "有效锚样本不足: {checked}");
+}
+
+/// 相对位置内部一致: q 由 qd/qz 按低起伏权重合成; 低起伏场景水平权重更大
+#[test]
+fn relative_position_weights_low_relief_horizontally() {
+    let run = |steep: f64| {
+        let (dem, _) = dual_valley(steep, false);
+        let (ctx, _r, _u, geom) = full_geometry(dem, 201, 201, 10.0);
+        // 特征起伏中位数
+        let mut hrel: Vec<f32> = ctx
+            .pyramid
+            .characteristic_relief_m
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+        hrel.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let h_med = hrel[hrel.len() / 2];
+        // 逐像元重算 q 验证一致性(w_distance 依赖逐像元 H*)
+        let mut err = 0f64;
+        let mut n = 0usize;
+        let mut w_acc = 0f64;
+        for i in 0..geom.relative_position.len() {
+            let (qd, qz) = (geom.q_distance[i], geom.q_elevation[i]);
+            if qd.is_finite() && qz.is_finite() && geom.relative_position[i].is_finite() {
+                let h_star = ctx.pyramid.characteristic_relief_m[i];
+                let w = 0.45f32
+                    + (0.75f32 - 0.45) * ((20.0 - h_star) / 20.0).clamp(0.0, 1.0);
+                let expect = (w * qd + (1.0 - w) * qz).clamp(0.0, 1.0);
+                err += (expect - geom.relative_position[i]).abs() as f64;
+                w_acc += w as f64;
+                n += 1;
+            }
+        }
+        let w_med = if n > 0 { w_acc / n as f64 } else { 0.0 };
+        (h_med, w_med, if n > 0 { err / n as f64 } else { f64::MAX })
+    };
+    let (h_steep, w_steep, e1) = run(0.08);
+    let (h_flat, w_flat, e2) = run(0.008);
+    assert!(e1 < 1e-3 && e2 < 1e-3, "q 内部一致性失败: {e1} {e2}");
+    assert!(w_flat > w_steep, "低起伏权重未提高: {w_flat} vs {w_steep}");
+    assert!(h_flat < h_steep, "场景起伏设置失败: {h_flat} vs {h_steep}");
+}
+
+/// 镜像场景的约束距离分布一致(中位差 <= 1 粗像元)
+#[test]
+fn mirrored_distance_distributions_match() {
+    let median = |steep: f64, mirror: bool| -> f64 {
+        let (dem, _) = dual_valley(steep, mirror);
+        let (_ctx, _r, _u, geom) = full_geometry(dem, 201, 201, 10.0);
+        let mut v: Vec<f32> = geom
+            .distance_to_valley_m
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2] as f64
+    };
+    let m1 = median(0.08, false);
+    let m2 = median(0.08, true);
+    assert!(
+        (m1 - m2).abs() <= 25.0,
+        "镜像距离中位差超 1 粗像元: {m1} vs {m2}"
+    );
+}
