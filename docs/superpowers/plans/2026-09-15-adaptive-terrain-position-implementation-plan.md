@@ -493,17 +493,17 @@ git commit -m "feat: implement ten-form geomorphon evidence"
 - Modify: `rust/topo_core/src/lib.rs`
 - Reuse: `rust/topo_core/src/segment.rs`
 
-- [ ] **Step 1: Write failing ridge and unit tests**
+- [x] **Step 1: Write failing ridge and unit tests**
 
 On a symmetric V-valley with two flanking ridges, assert the central valley is not marked ridge, each flank contains a continuous ridge, no slope unit crosses a ridge or stream barrier, and every non-flat valid cell has one reachable valley and ridge anchor. On a mirrored DEM, unit areas and distance distributions must match within one coarse cell.
 
-- [ ] **Step 2: Run and confirm failure**
+- [x] **Step 2: Run and confirm failure**
 
 Run: `cd rust; cargo test --release --test slope_geometry`
 
 Expected: unresolved `ridge` and `slope_unit` modules.
 
-- [ ] **Step 3: Implement ridge evidence**
+- [x] **Step 3: Implement ridge evidence**
 
 ```rust
 pub struct RidgeModel {
@@ -524,7 +524,7 @@ pub fn build_ridges(
 
 Label each fine-stream subcatchment by reverse traversal of `flow_to`. Mark contacts between different labels as primary divide candidates. Score supplements from inverse-terrain flow accumulation, positive normalized deviation, and `Peak|Ridge|Shoulder|Spur`. Retain supplements only when strength ≥0.7 and connected to a primary divide within `0.1 * characteristic_scale`, capped at 250 m. Thin the combined mask to one coarse cell without breaking connectivity.
 
-- [ ] **Step 4: Label slope units**
+- [x] **Step 4: Label slope units**
 
 ```rust
 pub struct SlopeUnits {
@@ -545,7 +545,7 @@ pub fn build_slope_units(
 
 Use the finest valid stream mask as valley barrier, ridge mask as crest barrier, and eight aspect sectors as secondary partitions. Seed each connected region between barriers and flood only to neighbours whose circular aspect difference is ≤90°. Merge regions smaller than four coarse cells into the neighbour with longest non-barrier boundary.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 Run: `cd rust; cargo test --release --test slope_geometry ridge_continuity slope_units_do_not_cross_barriers`
 
